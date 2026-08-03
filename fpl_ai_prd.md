@@ -22,6 +22,7 @@ Build a system that recommends, each gameweek, the optimal:
 - **Not** a multi-user product/SaaS — single user (you), single team, to start.
 - **Not** predicting live in-match events (bonus points, red cards) in real time — weekly cadence, not live.
 - **Not** full mini-league game theory (modelling specific rivals' squads and playing directly against them). v1 handles league context only through a single risk parameter (see §6a), not opponent-by-opponent strategy.
+- **Not** automatic inference of risk appetite from league standings in v1 — the parameter exists and the interface supports it, but v1 ships manual-only. See §6a.2.
 - **Not** optimizing for team value as a standalone objective — see §6a.3 for why this is deliberately excluded.
 
 ## 4. Target User
@@ -53,7 +54,7 @@ Secondary/qualitative: time saved per week, confidence in decisions, reduced "gu
 - **FR6:** Log every prediction and every recommendation made, with a way to compare predicted vs. actual after the gameweek resolves.
 - **FR7:** Present output in a reviewable format (not auto-executed) — e.g., a summary a human reads and approves.
 - **FR8:** Re-plan the full lookahead window every gameweek using latest data; execute only the current-gameweek decision (§6a.1).
-- **FR9:** Expose a single risk parameter, settable manually per gameweek or inferred automatically from a target league's context (§6a.2).
+- **FR9:** Expose a single risk parameter, settable manually per gameweek. The interface must accommodate a future auto-inference writer without changing the optimizer (§6a.2).
 - **FR10:** Provide named presets that configure risk and secondary weightings, without changing the underlying objective (§6a.3).
 
 ### Non-Functional
@@ -78,16 +79,23 @@ Implementation notes:
 - **Decay weighting** applied to future gameweeks (starting point: `1.0, 0.8, 0.6, 0.45, 0.3`), encoding declining confidence rather than pretending all weeks are equally knowable. Exact curve to be tuned via backtesting.
 - **Log each week's full plan** and compare against what was actually done the following week. If week-2 plans rarely survive contact with reality, that's evidence the horizon is too long or the decay curve too flat — a cheap, built-in diagnostic.
 
-### 6a.2 Risk appetite: one scalar, two ways to set it
+### 6a.2 Risk appetite: one scalar, manual in v1, auto-infer deferred
 
-The optimizer takes a **single risk parameter**. Two modes write to it:
+The optimizer takes a **single risk parameter**. The interface supports multiple writers:
 
-- **Manual** — set directly per gameweek by the user.
-- **Auto-infer** — computed from league context when manual is off.
+- **Manual** — set directly per gameweek by the user. **This is the only writer in v1.**
+- **Auto-infer** — computed from league context. **Deferred to post-backtest-harness (see §10, M6).**
 
-The optimizer only ever sees one number and does not know or care which mode produced it. This keeps the two modes from becoming two parallel systems.
+The optimizer only ever sees one number and does not know or care which mode produced it. This is precisely what makes deferring auto-infer cheap: the preset/objective architecture is unchanged, and adding the second writer later requires no optimizer changes.
 
-**Auto-infer must use more than league position.** Being 40 points behind in GW5 is recoverable with normal play; 40 behind in GW35 needs a hail mary. Inference inputs:
+**Why auto-infer is deferred rather than shipped:**
+1. **It can't be validated yet.** Calibrating a gap-to-risk mapping requires the backtesting harness (M4). Shipping it on day one means shipping a number nobody can check.
+2. **It's a new ingestion requirement** — pulling a specific mini-league's standings and rival scores — not present in the current data layer design. It expands milestone 1's scope for no v1 benefit.
+3. **It's the component most likely to overfit.** Small private leagues offer very few historical `(gap, GW remaining, swing)` observations to calibrate against.
+
+This follows the project's simplicity-over-scale principle: the whole preset architecture ships intact, without betting correctness on a calibration that can't yet be tested.
+
+**When built, auto-infer must use more than league position.** Being 40 points behind in GW5 is recoverable with normal play; 40 behind in GW35 needs a hail mary. Inference inputs:
 - Points gap to target
 - **Gameweeks remaining**
 - Gap volatility (how much positions in this league typically swing week to week)
@@ -113,10 +121,34 @@ Value therefore enters as a **soft tiebreaker inside the points objective**: whe
 
 Consequence: §6a.2 and §6a.3 collapse into one mechanism — presets are named configurations of the risk parameter plus a few secondary weights. One objective, tunable preferences.
 
+### 6a.4 Historical data provenance: trust features selectively, not backtests wholesale
+
+**The gap:** The snapshot mechanism (Architecture §4.1) gives leakage-free point-in-time data *from the day we start running it*. But M4 backtesting needs history that predates the project, and the FPL API exposes only current state. Pre-launch backtests must therefore rely on a third-party archive (primary candidate: `vaastav/Fantasy-Premier-League`), whose point-in-time fidelity is whatever cadence that project happened to capture.
+
+**This is a confirmed risk, not a theoretical one.** The archive's own data dictionary flags that its `xP` column is scraped from FPL's `ep_this` field *after* each gameweek ends, that FPL's update cadence for the field is undocumented, and that scraped values may reflect post-match rather than pre-deadline information — recommending the column be shifted or dropped for ML use. The README also indicates a reduced update cadence (on the order of a few major updates per season rather than continuous ingestion), which if current means volatile fields have little point-in-time fidelity at all. **Verify cadence directly before depending on it.**
+
+**Decision — partition features by leakage exposure rather than accepting or rejecting backtests wholesale:**
+
+| Class | Examples | Treatment |
+|---|---|---|
+| **Outcome-derived** | Minutes played, goals, assists, clean sheets, xG/xA from completed matches | **Trusted.** These are facts recorded after the match; their values don't change retroactively. No leakage risk as historical features. |
+| **State-at-deadline** | Injury flags, `chance_of_playing`, price, ownership %, `xP` | **Approximate.** Archive value may differ from what was observable at the deadline. Usable, but results depending on them are provisional. |
+
+Consequences:
+- Predictor backtests built primarily on outcome-derived features are **trustworthy now**.
+- Backtests whose conclusions hinge on state-at-deadline features are **provisional** until validated against our own accumulated snapshots.
+- `xP` is **excluded** as a feature by default, per the archive's own guidance.
+- Once ~1 season of own snapshots exists, measure archive-vs-snapshot divergence on the volatile fields to quantify how provisional the early backtests actually were.
+
+**Secondary sources to evaluate at M1:**
+- The archive already ships an `understat/` directory with xG data *and* an Understat-ID→FPL-ID mapping. The ID mapping is the genuinely fiddly part of Understat integration — this may remove the need for a hand-rolled scraper.
+- `olbauday/FPL-Core-Insights` — an alternative dataset fusing FPL API data with match stats and ClubElo ratings, covering recent seasons. Worth evaluating as a provenance cross-check.
+
 ## 7. Constraints
 
 - FPL's official API is public/unauthenticated for read access, but has **no official write/transfer API** — this is a hard constraint that shapes the "human-in-the-loop" scope decision, not just a preference.
 - Data on injuries/rotation is inherently incomplete and lags real-world news — the system will sometimes be wrong for reasons no model could fix (a manager's press-conference comment 2 hours before deadline).
+- **The FPL API exposes only current state, not history.** Point-in-time historical data for pre-launch seasons does not exist and cannot be reconstructed from the official API — it must come from third-party archives of unverified snapshot fidelity. See §6a.4.
 - No real budget for paid data feeds in v1 — rely on free sources (official API, Understat/FBref scraping).
 - Single developer/user — architecture should favor simplicity and iteration speed over scalability.
 
@@ -132,19 +164,24 @@ Consequence: §6a.2 and §6a.3 collapse into one mechanism — presets are named
 |---|---|
 | Prediction model overfits historical data, performs poorly live | Maintain a simple baseline model to compare against continuously; backtest on truly held-out seasons |
 | Injury/team-news data lags reality, causing bad recommendations right before deadline | Build in a manual override step before deadline; surface confidence/uncertainty on minutes predictions |
+| Third-party historical archive carries undetected lookahead leakage, making backtests overstate performance | Partition features by leakage exposure (§6a.4); exclude `xP`; label state-at-deadline-dependent results provisional; quantify divergence once own snapshots accumulate |
 | FPL API changes/breaks | Keep data layer isolated so only one module needs updating |
 | High variance makes it hard to tell if the system is "working" | Commit to full-season evaluation windows, not week-to-week judgment |
 | Time investment doesn't pay off vs. just playing FPL normally | Treat v1 as a learning project first, ranking improvement second |
 
 ## 10. Milestones (proposed)
 
-1. **Data layer**: pull + store historical FPL data, Understat data. *(Validates: can we even get clean data reliably?)*
+0. **Kickoff housekeeping**: dependency manager + pinned deps, `.env.example` with real `FPL_TEAM_ID`, repo scaffold, test runner. Small, but cheaper now than mid-build.
+1. **Data layer**: pull + store FPL API data; begin own snapshot accumulation immediately (every day of delay is history you can't recover). Evaluate archive sources and verify update cadence per §6a.4. Track purchase price per player from day one for selling-price correctness.
 2. **Baseline predictor + optimizer**: simple heuristic/Poisson model + LP solver → first end-to-end recommendation, even if crude.
 3. **ML predictor v1**: gradient-boosted model, compared against baseline.
-4. **Backtesting harness**: simulate past seasons, measure against actual results.
+4. **Backtesting harness**: simulate past seasons, measure against actual results. Label conclusions per the §6a.4 feature partition.
 5. **Weekly live run**: use it for real, log predictions vs. outcomes.
 6. **Strategy layer**: rolling-horizon transfers + chip timing logic.
-7. **(Stretch) Auto-execution**: revisit only after v1-v6 prove reliable and trustworthy.
+7. **Auto-infer risk parameter**: add the second writer to the risk scalar, calibrated against M4's harness. Deliberately after backtesting, per §6a.2.
+8. **(Stretch) Auto-execution**: revisit only after M1–M7 prove reliable and trustworthy.
+
+**Note on M1 urgency:** snapshot accumulation is the one task where starting earlier strictly dominates. Everything else can be built in any order; snapshots can only be collected forward in time.
 
 ## 11. Open Questions
 
@@ -152,10 +189,13 @@ Consequence: §6a.2 and §6a.3 collapse into one mechanism — presets are named
 - ~~How much lookahead is useful vs. noise?~~ → Rolling 3–5 GW horizon with decay weighting, re-planned weekly, only week 1 executed.
 - ~~Pure expected points or risk-adjusted?~~ → Always max expected points; a single risk parameter (manual or auto-inferred) tunes variance preference.
 - ~~How to handle team value?~~ → Not a competing objective. Enters as a soft tiebreaker via the *Value-conscious* preset.
+- ~~Does the predictor need to output a distribution?~~ → Already settled: the Predictor interface (Architecture §4.4) emits `std_dev` alongside the mean.
+- ~~Does chip evaluation need a separate horizon?~~ → Already settled: chips are evaluated by scenario comparison with a per-candidate-week horizon, deliberately outside the MILP (Architecture §4.6).
+- ~~Where does pre-launch historical data come from, and can we trust it?~~ → Partition features by leakage exposure (§6a.4) rather than accepting or rejecting backtests wholesale.
 
 ### Still open
-- **Selling-price correctness.** The optimizer must use *selling* price (purchase price + 50% of rise, rounded down), not current market price, or it will think the budget is larger than it is. Mechanically straightforward, but must be right from day one — it silently corrupts every recommendation otherwise. Requires tracking purchase price per player held.
+- **Selling-price correctness.** The optimizer must use *selling* price (purchase price + 50% of rise, rounded down), not current market price, or it will think the budget is larger than it is. Mechanically straightforward, but must be right from day one — it silently corrupts every recommendation otherwise. Requires tracking purchase price per player held (now folded into M1).
 - **Decay curve shape.** Starting point is `1.0, 0.8, 0.6, 0.45, 0.3`, but the right curve — and whether the horizon is 3, 4, or 5 — is an empirical question for the backtesting harness.
-- **Auto-infer calibration.** What gap-to-risk mapping actually helps? Needs backtesting against historical mini-league situations, and risks overfitting to a small number of season-end scenarios.
-- **Variance estimation.** The *Safe* and *Aggressive* presets need a per-player variance estimate, not just a mean. Does the predictor output a distribution, or do we approximate variance from historical points spread?
-- **Chip timing vs. rolling horizon.** Chips are once-per-season decisions whose value often lies beyond a 5-gameweek window (e.g., a double gameweek 10 weeks out). Does chip evaluation need a longer, separate horizon than the transfer optimizer?
+- **Variance source, not variance existence.** The Predictor already emits `std_dev`. The narrower open question: is historical points-spread an adequate proxy early on, or do the *Safe*/*Aggressive* presets need a genuinely distributional model (e.g. Poisson-based) from the start?
+- **Auto-infer calibration** (deferred to M7). What gap-to-risk mapping actually helps? Needs M4's harness, and risks overfitting to few season-end scenarios.
+- **Archive update cadence.** Needs direct verification (§6a.4) — if the primary archive updates only a few times per season, volatile-field fidelity may be low enough that state-at-deadline features are unusable rather than merely approximate.
