@@ -9,11 +9,20 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from fpl_optimizer.ingestion import archive_loader, understat
 from fpl_optimizer.ingestion.fpl_api import FPLClient
 from fpl_optimizer.ingestion.snapshots import save_raw
 from fpl_optimizer.storage import db
 
 DEFAULT_DB_PATH = Path("data/db/fpl.sqlite")
+
+
+def infer_current_season(bootstrap: dict) -> str:
+    """FPL runs Aug-May; derive '2026-27' from GW1's deadline year rather than wall-clock
+    time, since that's a property of the data, not of when ingest happens to run."""
+    gw1_deadline = bootstrap["events"][0]["deadline_time"]
+    start_year = int(gw1_deadline[:4])
+    return f"{start_year}-{str(start_year + 1)[2:]}"
 
 
 def _cmd_ingest(args: argparse.Namespace) -> None:
@@ -24,6 +33,7 @@ def _cmd_ingest(args: argparse.Namespace) -> None:
 
     bootstrap = client.bootstrap_static()
     save_raw("fpl_api", "bootstrap-static", bootstrap, when=now)
+    season = infer_current_season(bootstrap)
 
     fixtures = client.fixtures()
     save_raw("fpl_api", "fixtures", fixtures, when=now)
@@ -34,7 +44,7 @@ def _cmd_ingest(args: argparse.Namespace) -> None:
     db.upsert_element_types(conn, bootstrap["element_types"])
     db.upsert_players(conn, bootstrap["elements"], updated_at=now.isoformat())
     db.insert_player_snapshots(conn, bootstrap["elements"], snapshot_date=today, fetched_at=now.isoformat())
-    db.insert_fixtures(conn, fixtures)
+    db.insert_fixtures(conn, fixtures, season=season)
 
     print(
         f"Ingested {len(bootstrap['elements'])} players, "
@@ -56,6 +66,24 @@ def _cmd_ingest(args: argparse.Namespace) -> None:
     conn.close()
 
 
+def _cmd_bootstrap_season(args: argparse.Namespace) -> None:
+    conn = db.connect(args.db_path)
+    summary = archive_loader.bootstrap_season(conn, args.season)
+    conn.close()
+    print(f"Bootstrapped {args.season} from the vaastav archive:")
+    for key, value in summary.items():
+        print(f"  {key}: {value}")
+
+
+def _cmd_understat(args: argparse.Namespace) -> None:
+    conn = db.connect(args.db_path)
+    summary = understat.ingest_season(conn, args.season, max_players=args.max_players)
+    conn.close()
+    print(f"Understat ingest for {args.season}:")
+    for key, value in summary.items():
+        print(f"  {key}: {value}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fpl-optimizer")
     parser.add_argument("--db-path", type=Path, default=DEFAULT_DB_PATH)
@@ -63,6 +91,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = subparsers.add_parser("ingest", help="Fetch current FPL state; write raw snapshots and parse into SQLite.")
     ingest.set_defaults(func=_cmd_ingest)
+
+    bootstrap_season = subparsers.add_parser(
+        "bootstrap-season", help="Load a past season's FPL data from the vaastav archive (PRD §6a.4)."
+    )
+    bootstrap_season.add_argument("--season", required=True, help="e.g. 2024-25")
+    bootstrap_season.set_defaults(func=_cmd_bootstrap_season)
+
+    understat_cmd = subparsers.add_parser(
+        "understat", help="Fetch live Understat data for a season and match it to FPL players."
+    )
+    understat_cmd.add_argument("--season", required=True, help="e.g. 2026-27")
+    understat_cmd.add_argument("--max-players", type=int, default=None, help="Cap per-player match-log fetches.")
+    understat_cmd.set_defaults(func=_cmd_understat)
 
     return parser
 

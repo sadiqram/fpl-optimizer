@@ -46,11 +46,20 @@ def upsert_element_types(conn: sqlite3.Connection, element_types: list[dict]) ->
     conn.commit()
 
 
-def upsert_players(conn: sqlite3.Connection, players: list[dict], updated_at: str) -> None:
+def upsert_players(conn: sqlite3.Connection, players: list[dict], updated_at: str, is_live: bool = True) -> None:
+    """`players` dicts carry FPL's usual shape: id (season-specific element id), code
+    (cross-season stable id), first_name, second_name, web_name, team, element_type.
+    Rows are keyed on `code` — see schema.sql for why.
+
+    is_live must be False for archive-sourced rows: a past season's `id` is that season's
+    element id, not the current one, and must never be written to element_id — doing so
+    would let a historical bootstrap silently clobber the live id needed for API calls.
+    Only a live caller's `id` is trustworthy as "the current element_id".
+    """
     rows = [
         {
-            "id": p["id"],
-            "code": p["code"],
+            "id": p["code"],
+            "element_id": p.get("id") if is_live else None,
             "first_name": p["first_name"],
             "second_name": p["second_name"],
             "web_name": p["web_name"],
@@ -62,10 +71,10 @@ def upsert_players(conn: sqlite3.Connection, players: list[dict], updated_at: st
     ]
     conn.executemany(
         """
-        INSERT INTO players (id, code, first_name, second_name, web_name, team_id, element_type, updated_at)
-        VALUES (:id, :code, :first_name, :second_name, :web_name, :team_id, :element_type, :updated_at)
+        INSERT INTO players (id, element_id, first_name, second_name, web_name, team_id, element_type, updated_at)
+        VALUES (:id, :element_id, :first_name, :second_name, :web_name, :team_id, :element_type, :updated_at)
         ON CONFLICT(id) DO UPDATE SET
-            code = excluded.code,
+            element_id = COALESCE(excluded.element_id, players.element_id),
             first_name = excluded.first_name,
             second_name = excluded.second_name,
             web_name = excluded.web_name,
@@ -90,7 +99,7 @@ def insert_player_snapshots(
 
     rows = [
         {
-            "player_id": p["id"],
+            "player_id": p["code"],
             "snapshot_date": snapshot_date,
             "fetched_at": fetched_at,
             "source": source,
@@ -126,10 +135,13 @@ def insert_player_snapshots(
     conn.commit()
 
 
-def insert_fixtures(conn: sqlite3.Connection, fixtures: list[dict]) -> None:
+def insert_fixtures(conn: sqlite3.Connection, fixtures: list[dict], season: str) -> None:
+    """season is required — fixture id resets to 1 every season, so (season, id) is the
+    real key (schema.sql)."""
     rows = [
         {
             "id": f["id"],
+            "season": season,
             "event": f.get("event"),
             "kickoff_time": f.get("kickoff_time"),
             "team_h": f["team_h"],
@@ -145,13 +157,13 @@ def insert_fixtures(conn: sqlite3.Connection, fixtures: list[dict]) -> None:
     conn.executemany(
         """
         INSERT INTO fixtures (
-            id, event, kickoff_time, team_h, team_a, team_h_difficulty, team_a_difficulty,
+            id, season, event, kickoff_time, team_h, team_a, team_h_difficulty, team_a_difficulty,
             finished, team_h_score, team_a_score
         ) VALUES (
-            :id, :event, :kickoff_time, :team_h, :team_a, :team_h_difficulty, :team_a_difficulty,
+            :id, :season, :event, :kickoff_time, :team_h, :team_a, :team_h_difficulty, :team_a_difficulty,
             :finished, :team_h_score, :team_a_score
         )
-        ON CONFLICT(id) DO UPDATE SET
+        ON CONFLICT(season, id) DO UPDATE SET
             event = excluded.event,
             kickoff_time = excluded.kickoff_time,
             team_h_difficulty = excluded.team_h_difficulty,
@@ -161,6 +173,81 @@ def insert_fixtures(conn: sqlite3.Connection, fixtures: list[dict]) -> None:
             team_a_score = excluded.team_a_score
         """,
         rows,
+    )
+    conn.commit()
+
+
+def insert_player_gw_stats(conn: sqlite3.Connection, rows: list[dict], source: str, season: str) -> None:
+    """Outcome facts, immutable once written. `rows` items: player_id (code), gameweek,
+    minutes, total_points, goals_scored, assists, clean_sheets, goals_conceded, bonus, bps,
+    expected_goals, expected_assists. Trusted from any source (PRD §6a.4) — these don't
+    change retroactively, unlike player_snapshots. season is required: gameweek numbers
+    reset every season, so (player_id, gameweek) alone is not unique across seasons."""
+    payload = [{**row, "source": source, "season": season} for row in rows]
+    conn.executemany(
+        """
+        INSERT INTO player_gw_stats (
+            player_id, season, gameweek, source, minutes, total_points, goals_scored, assists,
+            clean_sheets, goals_conceded, bonus, bps, expected_goals, expected_assists
+        ) VALUES (
+            :player_id, :season, :gameweek, :source, :minutes, :total_points, :goals_scored, :assists,
+            :clean_sheets, :goals_conceded, :bonus, :bps, :expected_goals, :expected_assists
+        )
+        ON CONFLICT(player_id, season, gameweek, source) DO UPDATE SET
+            minutes = excluded.minutes,
+            total_points = excluded.total_points,
+            goals_scored = excluded.goals_scored,
+            assists = excluded.assists,
+            clean_sheets = excluded.clean_sheets,
+            goals_conceded = excluded.goals_conceded,
+            bonus = excluded.bonus,
+            bps = excluded.bps,
+            expected_goals = excluded.expected_goals,
+            expected_assists = excluded.expected_assists
+        """,
+        payload,
+    )
+    conn.commit()
+
+
+def insert_understat_player_gw(conn: sqlite3.Connection, rows: list[dict]) -> None:
+    """rows: player_id (code), season, gameweek, xg, xa, shots, key_passes."""
+    conn.executemany(
+        """
+        INSERT INTO understat_player_gw (player_id, season, gameweek, xg, xa, shots, key_passes)
+        VALUES (:player_id, :season, :gameweek, :xg, :xa, :shots, :key_passes)
+        ON CONFLICT(player_id, season, gameweek) DO UPDATE SET
+            xg = excluded.xg,
+            xa = excluded.xa,
+            shots = excluded.shots,
+            key_passes = excluded.key_passes
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def upsert_player_id_map(conn: sqlite3.Connection, rows: list[dict]) -> None:
+    """rows: {code, understat_id, match_method, notes (optional)}."""
+    payload = [
+        {
+            "fpl_id": r["code"],
+            "understat_id": r["understat_id"],
+            "match_method": r["match_method"],
+            "notes": r.get("notes"),
+        }
+        for r in rows
+    ]
+    conn.executemany(
+        """
+        INSERT INTO player_id_map (fpl_id, understat_id, match_method, notes)
+        VALUES (:fpl_id, :understat_id, :match_method, :notes)
+        ON CONFLICT(fpl_id) DO UPDATE SET
+            understat_id = excluded.understat_id,
+            match_method = excluded.match_method,
+            notes = excluded.notes
+        """,
+        payload,
     )
     conn.commit()
 
