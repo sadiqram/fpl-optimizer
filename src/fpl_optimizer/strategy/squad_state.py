@@ -25,6 +25,18 @@ def resolve_purchase_price(conn, player_id: int, season: str) -> int | None:
     return db.get_earliest_own_snapshot_price(conn, player_id)
 
 
+def next_free_transfers(available: int, transfers_made: int, cap: int = constraints.FREE_TRANSFER_CAP) -> int:
+    """One step of FPL's banking rule: `available` FTs going into a gameweek, `transfers_made`
+    used that week -> FTs available for the *next* gameweek. Never call this for a gameweek
+    a wildcard/free hit was played — those don't consume or grow the banked count at all
+    (see compute_free_transfers), so they're skipped from the simulation entirely rather than
+    treated as "0 transfers used" here. Shared by compute_free_transfers (live, from
+    entry_history) and evaluation/season_simulation.py (synthetic, backtest-driven) so the
+    two can't drift on this rule."""
+    used = min(transfers_made, available)
+    return min(cap, available - used + 1)
+
+
 def compute_free_transfers(
     gw_history: list[dict], chips_played: list[dict], cap: int = constraints.FREE_TRANSFER_CAP
 ) -> int:
@@ -36,17 +48,13 @@ def compute_free_transfers(
 
     GW1 never contributes (picking your initial 15 isn't a "transfer") — the baseline of 1
     free transfer is what's available going into GW2, so the simulation starts there.
-    Playing Wildcard/Free Hit a given week doesn't consume or grow the banked count at all
-    (the official rule) — those gameweeks are skipped from the simulation entirely, not
-    treated as "0 transfers used".
     """
     chip_events = {c["event"] for c in chips_played if c["name"] in ("wildcard", "freehit")}
     available = 1
     for row in sorted((r for r in gw_history if r["event"] >= 2), key=lambda r: r["event"]):
         if row["event"] in chip_events:
             continue
-        used = min(row["event_transfers"], available)
-        available = min(cap, available - used + 1)
+        available = next_free_transfers(available, row["event_transfers"], cap)
     return available
 
 

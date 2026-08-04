@@ -257,6 +257,72 @@ def _cmd_recommend(args: argparse.Namespace) -> None:
     print(f"\n  Logged {len(prediction_rows)} predictions and recommendation {run_id} for later `evaluate`.")
 
 
+def _cmd_plan(args: argparse.Namespace) -> None:
+    """Rolling-horizon transfer + lineup planning against a real owned squad (M6, FR3/4/8).
+    Distinct from `recommend`, which picks a fresh 15 from scratch (still useful for
+    wildcards and backtesting) — `plan` requires `squad` to have been run first, same
+    pattern `evaluate` already uses for `results`."""
+    conn = db.connect(args.db_path)
+    the_clock = clock.FixedClock(args.as_of) if args.as_of else clock.SystemClock()
+
+    team_state_row = db.get_team_state(conn, args.season, args.gameweek)
+    owned_rows = db.get_owned_squad(conn, args.season, args.gameweek - 1)
+    if team_state_row is None or not owned_rows:
+        conn.close()
+        raise SystemExit(
+            f"No squad state for {args.season} GW{args.gameweek} — run `fpl-optimizer squad` first."
+        )
+
+    current_prices = {r["player_id"]: r["now_cost"] for r in db.get_player_snapshots_as_of(conn, the_clock.today())}
+    owned_squad = pd.DataFrame([
+        {
+            "player_id": r["player_id"],
+            # Selling price is recomputed from the latest known price, not frozen at
+            # `squad` ingest time — price moves between when you last checked and now.
+            # An unresolved purchase_price (NFR2) falls back to current price (break-even).
+            "selling_price": (
+                constraints.selling_price(r["purchase_price"], current_prices[r["player_id"]])
+                if r["purchase_price"] is not None and r["player_id"] in current_prices
+                else current_prices.get(r["player_id"], r["purchase_price"])
+            ),
+        }
+        for r in owned_rows
+    ])
+
+    predictor = _load_predictor(args)
+    result = horizon.plan_horizon(
+        conn, the_clock, args.season, args.gameweek, predictor, owned_squad,
+        bank=team_state_row["bank"] or 0, free_transfers=team_state_row["free_transfers"],
+    )
+    transfer_result, picked = result["transfer_result"], result["lineup"]
+    week1 = result["weekly_predictions"][0]["predictions"]
+
+    names = {r["id"]: r["web_name"] for r in conn.execute("SELECT id, web_name FROM players").fetchall()}
+    conn.close()
+
+    def label(player_id: int) -> str:
+        pts = week1.loc[week1.player_id == player_id, "expected_points"]
+        pts_str = f"{pts.iloc[0]:.1f} xPts" if len(pts) else "? xPts"
+        tag = " (C)" if player_id == picked["captain"] else " (VC)" if player_id == picked["vice_captain"] else ""
+        return f"{names.get(player_id, f'#{player_id}')}{tag} — {pts_str}"
+
+    print(f"Plan for {args.season} GW{args.gameweek} ({args.model} model, as of {result['as_of_date']})")
+    if transfer_result["transfers_in"]:
+        print("\n  Transfers:")
+        for out_id, in_id in zip(transfer_result["transfers_out"], transfer_result["transfers_in"]):
+            print(f"    OUT {names.get(out_id, f'#{out_id}')}  ->  IN {names.get(in_id, f'#{in_id}')}")
+        print(f"  Hits taken: {transfer_result['hits_taken']} (-{transfer_result['hit_cost']} pts)")
+        print(f"  Net expected points gain (horizon, net of hits): {transfer_result['expected_points_gain']:.1f}")
+    else:
+        print("\n  Hold — no transfer clears the hit threshold this week.")
+    print("\n  Starting XI:")
+    for player_id in picked["starting_xi"]:
+        print(f"    {label(player_id)}")
+    print("  Bench:")
+    for player_id in picked["bench"]:
+        print(f"    {label(player_id)}")
+
+
 def _cmd_train(args: argparse.Namespace) -> None:
     conn = db.connect(args.db_path)
 
@@ -446,6 +512,15 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_cmd.add_argument("--as-of", default=None, help="ISO date; defaults to today.")
     recommend_cmd.add_argument("--model", choices=MODEL_CHOICES, default="poisson")
     recommend_cmd.set_defaults(func=_cmd_recommend)
+
+    plan_cmd = subparsers.add_parser(
+        "plan", help="Rolling-horizon transfer + lineup plan against the owned squad (M6, FR3/4/8). Requires `squad` first."
+    )
+    plan_cmd.add_argument("--season", required=True, help="e.g. 2026-27")
+    plan_cmd.add_argument("--gameweek", type=int, required=True)
+    plan_cmd.add_argument("--as-of", default=None, help="ISO date; defaults to today.")
+    plan_cmd.add_argument("--model", choices=MODEL_CHOICES, default="poisson")
+    plan_cmd.set_defaults(func=_cmd_plan)
 
     train_cmd = subparsers.add_parser(
         "train", help="Train the GBM ensemble on a gameweek range; compare MAE against baselines on a held-out range."

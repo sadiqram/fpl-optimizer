@@ -5,9 +5,12 @@ import sqlite3
 import pandas as pd
 import pytest
 
+from fpl_optimizer.clock import FixedClock
+from fpl_optimizer.features import build as feature_build
+from fpl_optimizer.models.baseline import NaivePredictor
 from fpl_optimizer.optimize import squad
 from fpl_optimizer.storage import db
-from fpl_optimizer.strategy import squad_state, transfers
+from fpl_optimizer.strategy import horizon, squad_state, transfers
 
 
 def test_compute_free_transfers_accrues_one_per_unused_gameweek():
@@ -221,3 +224,102 @@ def test_optimize_transfers_respects_selling_price_not_now_cost():
     # kept-owned players, now_cost for newly-bought ones) — this is the actual constraint
     # the solver enforced, not a re-derivation that could mask a bug in the original one.
     assert result["new_squad"]["price"].sum() <= total_budget
+
+
+@pytest.fixture
+def season_conn():
+    """A real (season, gameweek) history — squad.build_squad needs genuine position/team
+    variety to have real choices, and plan_horizon needs actual fixtures/gw_stats to build
+    features from, so a raw synthetic pool (as above) isn't enough here. Same shape as
+    test_evaluation.py's `conn` fixture."""
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    db.init_db(connection)
+
+    db.upsert_teams(connection, [{"id": t, "name": f"Team{t}", "short_name": f"T{t}"} for t in range(1, 7)])
+    db.upsert_element_types(connection, [
+        {"id": 1, "singular_name_short": "GKP", "singular_name": "Goalkeeper"},
+        {"id": 2, "singular_name_short": "DEF", "singular_name": "Defender"},
+        {"id": 3, "singular_name_short": "MID", "singular_name": "Midfielder"},
+        {"id": 4, "singular_name_short": "FWD", "singular_name": "Forward"},
+    ])
+    players = [
+        {"id": i, "code": i, "first_name": f"P{i}", "second_name": f"P{i}", "web_name": f"P{i}",
+         "team": (i % 6) + 1, "element_type": [1, 2, 3, 4][i % 4]}
+        for i in range(1, 41)
+    ]
+    db.upsert_players(connection, players, updated_at="2025-08-01T00:00:00Z")
+    db.insert_player_snapshots(connection, [
+        {"code": p["id"], "now_cost": 45 + (p["id"] % 10) * 5, "selected_by_percent": "10.0", "status": "a",
+         "chance_of_playing_this_round": None, "chance_of_playing_next_round": None, "news": ""}
+        for p in players
+    ], snapshot_date="2025-08-01", fetched_at="2025-08-01T00:00:00Z")
+    db.insert_fixtures(connection, [
+        {"id": 1, "event": 1, "kickoff_time": "2025-08-16T14:00:00Z", "team_h": 1, "team_a": 2,
+         "team_h_difficulty": 3, "team_a_difficulty": 3, "finished": True, "team_h_score": 1, "team_a_score": 1},
+        {"id": 2, "event": 2, "kickoff_time": "2025-08-23T14:00:00Z", "team_h": 3, "team_a": 4,
+         "team_h_difficulty": 3, "team_a_difficulty": 3, "finished": True, "team_h_score": 2, "team_a_score": 0},
+    ], season="2025-26")
+    db.insert_player_gw_stats(connection, [
+        {"player_id": p["id"], "gameweek": 1, "minutes": 90, "total_points": p["id"] % 8,
+         "goals_scored": 0, "assists": 0, "clean_sheets": 0, "goals_conceded": 1, "bonus": 0, "bps": 10,
+         "expected_goals": 0.1, "expected_assists": 0.0} for p in players
+    ], source="fpl_api", season="2025-26")
+    db.insert_player_gw_stats(connection, [
+        {"player_id": p["id"], "gameweek": 2, "minutes": 90, "total_points": (p["id"] * 3) % 10,
+         "goals_scored": 0, "assists": 0, "clean_sheets": 0, "goals_conceded": 1, "bonus": 0, "bps": 10,
+         "expected_goals": 0.1, "expected_assists": 0.0} for p in players
+    ], source="fpl_api", season="2025-26")
+
+    yield connection
+    connection.close()
+
+
+def _week3_usable(conn) -> pd.DataFrame:
+    predictor = NaivePredictor()
+    predictor.fit(pd.DataFrame())
+    features_df = feature_build.assemble_features(conn, "2025-08-25", "2025-26", 3)
+    predictions = predictor.predict(features_df)
+    merged = predictions.merge(
+        features_df[["player_id", "element_type", "team_id", "now_cost"]], on="player_id", how="left"
+    )
+    return merged.dropna(subset=["element_type", "team_id", "now_cost", "expected_points"])
+
+
+def test_plan_horizon_holds_when_owned_squad_is_already_the_windows_optimum(season_conn):
+    usable = _week3_usable(season_conn)
+    initial_squad = squad.build_squad(usable)
+    owned = initial_squad[["player_id", "now_cost"]].rename(columns={"now_cost": "selling_price"})
+
+    predictor = NaivePredictor()
+    predictor.fit(pd.DataFrame())
+    result = horizon.plan_horizon(
+        season_conn, FixedClock("2025-08-25"), "2025-26", gameweek=3, predictor=predictor,
+        owned_squad=owned, bank=0, free_transfers=1, decay=[1.0],
+    )
+
+    # Single-week decay ([1.0]) means the horizon score is exactly this week's own
+    # prediction — identical to what built `initial_squad` directly, so nothing should move.
+    assert result["transfer_result"]["transfers_in"] == []
+    assert result["transfer_result"]["transfers_out"] == []
+    assert len(result["lineup"]["starting_xi"]) == 11
+    assert len(result["lineup"]["bench"]) == 4
+
+
+def test_plan_horizon_weekly_predictions_span_the_full_decay_window(season_conn):
+    usable = _week3_usable(season_conn)
+    initial_squad = squad.build_squad(usable)
+    owned = initial_squad[["player_id", "now_cost"]].rename(columns={"now_cost": "selling_price"})
+
+    predictor = NaivePredictor()
+    predictor.fit(pd.DataFrame())
+    result = horizon.plan_horizon(
+        season_conn, FixedClock("2025-08-25"), "2025-26", gameweek=3, predictor=predictor,
+        owned_squad=owned, bank=0, free_transfers=1, decay=[1.0, 0.5, 0.25],
+    )
+
+    assert [wp["gameweek"] for wp in result["weekly_predictions"]] == [3, 4, 5]
+    # Week 1 (GW3) must be the actual undecayed prediction the lineup/captain get scored on.
+    week1 = result["weekly_predictions"][0]["predictions"].set_index("player_id")["expected_points"]
+    direct = usable.set_index("player_id")["expected_points"]
+    pd.testing.assert_series_equal(week1.sort_index(), direct.sort_index(), check_names=False)

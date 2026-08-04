@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from fpl_optimizer.clock import FixedClock, SystemClock
-from fpl_optimizer.evaluation import backtest, metrics
+from fpl_optimizer.evaluation import backtest, metrics, season_simulation
 from fpl_optimizer.models.baseline import NaivePredictor
 from fpl_optimizer.storage import db
 
@@ -115,3 +115,36 @@ def test_backtest_season_skips_gameweeks_with_no_recorded_outcome(conn):
     result = backtest.backtest_season(conn, "2025-26", start_gameweek=2, end_gameweek=5, predictor=predictor)
     # GW3-5 have no player_gw_stats rows in this fixture — skipped, not zero-filled.
     assert set(result["gameweek"]) == {2}
+
+
+def test_simulate_season_with_transfers_defaults_a_fresh_opening_squad(conn):
+    predictor = NaivePredictor()
+    predictor.fit(pd.DataFrame())
+    result = season_simulation.simulate_season_with_transfers(conn, "2025-26", start_gameweek=2, end_gameweek=2, predictor=predictor)
+
+    assert len(result) == 1
+    row = result.iloc[0]
+    assert row["gameweek"] == 2
+    assert row["squad_actual_points"] >= 0
+    assert row["free_transfers_available"] == 1  # baseline going into the very first iteration
+    assert isinstance(row["transfers_in"], list) and isinstance(row["transfers_out"], list)
+
+
+def test_simulate_season_with_transfers_carries_state_through_unscored_gameweeks(conn):
+    """GW3-5 have no player_gw_stats in this fixture (same as backtest_season's equivalent
+    test) — must be skipped from the *returned* rows but must not halt the simulation or
+    lose squad continuity, unlike backtest_season's independent-per-gameweek replay."""
+    predictor = NaivePredictor()
+    predictor.fit(pd.DataFrame())
+    result = season_simulation.simulate_season_with_transfers(conn, "2025-26", start_gameweek=2, end_gameweek=5, predictor=predictor)
+    assert set(result["gameweek"]) == {2}
+
+
+def test_simulate_season_with_transfers_never_exceeds_budget(conn):
+    predictor = NaivePredictor()
+    predictor.fit(pd.DataFrame())
+    result = season_simulation.simulate_season_with_transfers(conn, "2025-26", start_gameweek=2, end_gameweek=2, predictor=predictor)
+    # bank is what's reported *going into* the gameweek in this row (before that week's
+    # transfers), so it must never be negative — a negative bank would mean a transfer
+    # spent money the squad didn't have.
+    assert (result["bank"] >= 0).all()
