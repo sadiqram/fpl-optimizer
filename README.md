@@ -22,12 +22,16 @@ fpl-optimizer ingest                                    # fetch current FPL stat
 fpl-optimizer bootstrap-season --season 2024-25          # load a past season from the vaastav archive
 fpl-optimizer understat --season 2024-25 --max-players 5 # fetch live Understat data, match to FPL players
 fpl-optimizer features --season 2024-25 --gameweek 20    # build + materialize features for one (season, gameweek)
+fpl-optimizer recommend --season 2024-25 --gameweek 20 --model poisson  # predict + optimize: squad, XI, captain
 ```
+
+`--model` is `naive` (recent scoring average) or `poisson` (default — goals/assists/clean-sheets
+modelled from xG/xA/team defense, scored by real FPL position rules). Both are permanent
+baselines to compare a real model against, not scaffolding (Architecture §4.4).
 
 Planned, not yet implemented (see milestones in the PRD):
 
 ```bash
-fpl-optimizer recommend --gameweek 12
 fpl-optimizer backtest --season 2023-24
 fpl-optimizer evaluate --gameweek 11
 ```
