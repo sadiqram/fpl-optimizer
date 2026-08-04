@@ -318,3 +318,24 @@ ever serialized a recommendation to JSON.
 **Fix:** Wrapped both in `int(...)` in `lineup.py`, at the source, rather than defensively
 casting in every caller. Regression test asserts `type(...) is int` and round-trips through
 `json.dumps` directly, so this can't silently regress back to a numpy scalar.
+
+---
+
+## 17. M7 assumed to be next after M6 — checked before starting, wasn't
+
+**When:** Right after M6 (Strategy layer) shipped, scoping M7 (auto-infer risk parameter)
+per the PRD's own milestone order.
+**Found by:** Deliberately checking what "calibrated against M4's harness" (PRD §10's own
+M7 description) would actually mean before writing any code — same "verify the plan is
+buildable before building it" instinct as entries #2/#3, not a bug caught by running
+something.
+**What happened:** M4's backtest harness and M6's `season_simulation.py` both replay
+*archived* seasons using only the model's own predictions. Neither, nor anything else in
+this project, has ever tracked a mini-league's rivals — historically or live. So "calibrated
+against M4's harness" has no real referent yet: there is no `(gap, GW remaining, swing)`
+history anywhere to calibrate a mapping against, which is exactly the overfitting risk the
+PRD's own §11 already named as a risk of building this early.
+**Resolution:** Not a code change — M7 is deferred (PRD §10/§11 updated to say so
+explicitly), not simply next in the queue. Revisit once the live season has started and a
+real mini-league's standings have actually been snapshotted for a few gameweeks; there's
+nothing to build correctly before then.

@@ -171,14 +171,16 @@ Consequences:
 
 ## 10. Milestones (proposed)
 
-0. **Kickoff housekeeping**: dependency manager + pinned deps, `.env.example` with real `FPL_TEAM_ID`, repo scaffold, test runner. Small, but cheaper now than mid-build.
-1. **Data layer**: pull + store FPL API data; begin own snapshot accumulation immediately (every day of delay is history you can't recover). Evaluate archive sources and verify update cadence per §6a.4. Track purchase price per player from day one for selling-price correctness.
-2. **Baseline predictor + optimizer**: simple heuristic/Poisson model + LP solver → first end-to-end recommendation, even if crude.
-3. **ML predictor v1**: gradient-boosted model, compared against baseline.
-4. **Backtesting harness**: simulate past seasons, measure against actual results. Label conclusions per the §6a.4 feature partition.
-5. **Weekly live run**: use it for real, log predictions vs. outcomes.
-6. **Strategy layer**: rolling-horizon transfers + chip timing logic.
-7. **Auto-infer risk parameter**: add the second writer to the risk scalar, calibrated against M4's harness. Deliberately after backtesting, per §6a.2.
+**Status (2026-08-04): M0–M6 done. M7 is deliberately deferred — see its entry below, not just unscheduled.**
+
+0. **Kickoff housekeeping** — done: dependency manager + pinned deps, `.env.example` with real `FPL_TEAM_ID`, repo scaffold, test runner. Small, but cheaper now than mid-build.
+1. **Data layer** — done: pull + store FPL API data; begin own snapshot accumulation immediately (every day of delay is history you can't recover). Evaluate archive sources and verify update cadence per §6a.4. Track purchase price per player from day one for selling-price correctness.
+2. **Baseline predictor + optimizer** — done: simple heuristic/Poisson model + LP solver → first end-to-end recommendation, even if crude.
+3. **ML predictor v1** — done: gradient-boosted model, compared against baseline.
+4. **Backtesting harness** — done: simulate past seasons, measure against actual results. Label conclusions per the §6a.4 feature partition.
+5. **Weekly live run** — done: use it for real, log predictions vs. outcomes.
+6. **Strategy layer** — done: rolling-horizon transfers + chip timing logic (`fpl-optimizer squad`/`plan`, presets, chip scenario comparison).
+7. **Auto-infer risk parameter** — **deferred**, not just next in line. Adding the second writer to the risk scalar was meant to be "calibrated against M4's harness," but M4's backtest harness and M6's season simulator only ever replay *archived* seasons using the model's own predictions — this project has never tracked a mini-league's rivals, historically or live, so there is no real `(gap, GW remaining, swing)` data to calibrate a mapping against yet (exactly the overfitting risk already named below). Revisit once the live season has started and a real mini-league's standings have actually been snapshotted for a few gameweeks — not before.
 8. **(Stretch) Auto-execution**: revisit only after M1–M7 prove reliable and trustworthy.
 
 **Note on M1 urgency:** snapshot accumulation is the one task where starting earlier strictly dominates. Everything else can be built in any order; snapshots can only be collected forward in time.
@@ -197,5 +199,5 @@ Consequences:
 - **Selling-price correctness.** The optimizer must use *selling* price (purchase price + 50% of rise, rounded down), not current market price, or it will think the budget is larger than it is. Mechanically straightforward, but must be right from day one — it silently corrupts every recommendation otherwise. Requires tracking purchase price per player held (now folded into M1).
 - **Decay curve shape.** Starting point is `1.0, 0.8, 0.6, 0.45, 0.3`, but the right curve — and whether the horizon is 3, 4, or 5 — is an empirical question for the backtesting harness.
 - **Variance source, not variance existence.** The Predictor already emits `std_dev`. The narrower open question: is historical points-spread an adequate proxy early on, or do the *Safe*/*Aggressive* presets need a genuinely distributional model (e.g. Poisson-based) from the start?
-- **Auto-infer calibration** (deferred to M7). What gap-to-risk mapping actually helps? Needs M4's harness, and risks overfitting to few season-end scenarios.
+- **Auto-infer calibration** (M7 itself now deferred, per §10 — not just this sub-question). What gap-to-risk mapping actually helps? Needs real mini-league standings history, which doesn't exist yet for any archived or live season this project has touched; M4/M6's backtest tooling can't substitute for it, so calibrating now would risk overfitting to an invented scenario rather than a real one.
 - **Archive update cadence.** Needs direct verification (§6a.4) — if the primary archive updates only a few times per season, volatile-field fidelity may be low enough that state-at-deadline features are unusable rather than merely approximate.
