@@ -106,7 +106,9 @@ def plan_horizon(
     appetite shapes which squad you end up with, not how a player's own week is reported.
 
     Returns {"as_of_date", "gameweek", "weekly_predictions" (list of {"gameweek",
-    "predictions"} per window week, usable rows only, for logging/rationale),
+    "predictions"} per window week, usable rows only, for logging/rationale), "pool" (the
+    risk-adjusted, horizon-weighted scoring `transfer_result` was chosen from — exposed for
+    `strategy.chips`' Wildcard scenario, which needs the same basis for a fair comparison),
     "transfer_result" (see `transfers.optimize_transfers`), "lineup"}.
     """
     as_of_date = clock.today()
@@ -148,6 +150,7 @@ def plan_horizon(
         "as_of_date": as_of_date,
         "gameweek": gameweek,
         "weekly_predictions": weekly_predictions,
+        "pool": pool,
         "transfer_result": transfer_result,
         "lineup": lineup_result,
     }

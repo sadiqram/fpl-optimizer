@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -24,10 +25,11 @@ from fpl_optimizer.models.baseline import NaivePredictor, PoissonPredictor
 from fpl_optimizer.models.ensemble import EnsemblePredictor
 from fpl_optimizer.optimize import constraints
 from fpl_optimizer.storage import db
-from fpl_optimizer.strategy import horizon, risk, squad_state
+from fpl_optimizer.strategy import chips, horizon, risk, squad_state
 
 PREDICTORS = {"naive": NaivePredictor, "poisson": PoissonPredictor}
 MODEL_CHOICES = [*sorted(PREDICTORS), "gbm"]
+CHIP_DISPLAY_NAMES = {"wildcard": "Wildcard", "freehit": "Free Hit", "bboost": "Bench Boost", "3xc": "Triple Captain"}
 
 DEFAULT_DB_PATH = Path("data/db/fpl.sqlite")
 DEFAULT_MODELS_DIR = Path("data/artifacts/models")
@@ -302,6 +304,11 @@ def _cmd_plan(args: argparse.Namespace) -> None:
     transfer_result, picked = result["transfer_result"], result["lineup"]
     week1 = result["weekly_predictions"][0]["predictions"]
 
+    chips_available = json.loads(team_state_row["chips_available"] or "[]")
+    chip_scenarios = chips.evaluate_chip_scenarios(
+        result, owned_squad, bank=team_state_row["bank"] or 0, chips_available=chips_available
+    )
+
     names = {r["id"]: r["web_name"] for r in conn.execute("SELECT id, web_name FROM players").fetchall()}
     conn.close()
 
@@ -327,6 +334,11 @@ def _cmd_plan(args: argparse.Namespace) -> None:
     print("  Bench:")
     for player_id in picked["bench"]:
         print(f"    {label(player_id)}")
+
+    if chip_scenarios:
+        print("\n  Chip opportunities:")
+        for chip_name, scenario in chip_scenarios.items():
+            print(f"    {CHIP_DISPLAY_NAMES.get(chip_name, chip_name)}: {scenario['delta']:+.1f} pts — {scenario['reasoning']}")
 
 
 def _cmd_train(args: argparse.Namespace) -> None:

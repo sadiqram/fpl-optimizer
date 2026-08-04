@@ -10,7 +10,7 @@ from fpl_optimizer.features import build as feature_build
 from fpl_optimizer.models.baseline import NaivePredictor
 from fpl_optimizer.optimize import squad
 from fpl_optimizer.storage import db
-from fpl_optimizer.strategy import horizon, risk, squad_state, transfers
+from fpl_optimizer.strategy import chips, horizon, risk, squad_state, transfers
 
 
 def test_compute_free_transfers_accrues_one_per_unused_gameweek():
@@ -375,3 +375,59 @@ def test_manual_risk_writer_returns_the_same_value_for_any_gameweek():
     writer = risk.ManualRiskWriter(0.5)
     assert writer.get(1) == 0.5
     assert writer.get(38) == 0.5
+
+
+def _plan_result(season_conn, decay=(1.0,)):
+    usable = _week3_usable(season_conn)
+    initial_squad = squad.build_squad(usable)
+    owned = initial_squad[["player_id", "now_cost"]].rename(columns={"now_cost": "selling_price"})
+    predictor = NaivePredictor()
+    predictor.fit(pd.DataFrame())
+    plan_result = horizon.plan_horizon(
+        season_conn, FixedClock("2025-08-25"), "2025-26", gameweek=3, predictor=predictor,
+        owned_squad=owned, bank=0, free_transfers=1, decay=list(decay),
+    )
+    return plan_result, owned
+
+
+def test_evaluate_chip_scenarios_only_evaluates_available_chips(season_conn):
+    plan_result, owned = _plan_result(season_conn)
+    scenarios = chips.evaluate_chip_scenarios(plan_result, owned, bank=0, chips_available=["bboost"])
+    assert set(scenarios) == {"bboost"}
+
+
+def test_evaluate_chip_scenarios_bench_boost_equals_bench_points(season_conn):
+    plan_result, owned = _plan_result(season_conn)
+    scenarios = chips.evaluate_chip_scenarios(plan_result, owned, bank=0, chips_available=["bboost"])
+
+    week1 = plan_result["weekly_predictions"][0]["predictions"]
+    expected = float(week1[week1.player_id.isin(plan_result["lineup"]["bench"])]["expected_points"].sum())
+    assert scenarios["bboost"]["delta"] == pytest.approx(expected)
+
+
+def test_evaluate_chip_scenarios_triple_captain_equals_captain_points(season_conn):
+    plan_result, owned = _plan_result(season_conn)
+    scenarios = chips.evaluate_chip_scenarios(plan_result, owned, bank=0, chips_available=["3xc"])
+
+    week1 = plan_result["weekly_predictions"][0]["predictions"]
+    captain_id = plan_result["lineup"]["captain"]
+    expected = float(week1.loc[week1.player_id == captain_id, "expected_points"].iloc[0])
+    assert scenarios["3xc"]["delta"] == pytest.approx(expected)
+
+
+def test_evaluate_chip_scenarios_wildcard_never_worse_than_normal_plan(season_conn):
+    """Wildcard can freely re-pick from the same pool the normal plan already optimized
+    over — by construction it can never score worse (it's the same problem with a looser
+    constraint), so its delta must never be negative."""
+    plan_result, owned = _plan_result(season_conn)
+    scenarios = chips.evaluate_chip_scenarios(plan_result, owned, bank=0, chips_available=["wildcard"])
+    assert scenarios["wildcard"]["delta"] >= -1e-6
+
+
+def test_evaluate_chip_scenarios_sorted_by_delta_descending(season_conn):
+    plan_result, owned = _plan_result(season_conn)
+    scenarios = chips.evaluate_chip_scenarios(
+        plan_result, owned, bank=0, chips_available=["bboost", "3xc", "wildcard", "freehit"]
+    )
+    deltas = [v["delta"] for v in scenarios.values()]
+    assert deltas == sorted(deltas, reverse=True)
