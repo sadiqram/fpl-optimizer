@@ -9,17 +9,22 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import joblib
+
 from fpl_optimizer.features import build as feature_build
 from fpl_optimizer.ingestion import archive_loader, understat
 from fpl_optimizer.ingestion.fpl_api import FPLClient
 from fpl_optimizer.ingestion.snapshots import save_raw
+from fpl_optimizer.models import training_data
 from fpl_optimizer.models.baseline import NaivePredictor, PoissonPredictor
+from fpl_optimizer.models.ensemble import EnsemblePredictor
 from fpl_optimizer.optimize import constraints, lineup, squad
 from fpl_optimizer.storage import db
 
 PREDICTORS = {"naive": NaivePredictor, "poisson": PoissonPredictor}
 
 DEFAULT_DB_PATH = Path("data/db/fpl.sqlite")
+DEFAULT_MODELS_DIR = Path("data/artifacts/models")
 
 
 def infer_current_season(bootstrap: dict) -> str:
@@ -137,6 +142,44 @@ def _cmd_recommend(args: argparse.Namespace) -> None:
         print(f"    {label(player_id)}")
 
 
+def _cmd_train(args: argparse.Namespace) -> None:
+    conn = db.connect(args.db_path)
+
+    print(f"Building training set: {args.season} GW{args.train_start}-{args.train_end}...")
+    train_features, train_targets = training_data.build_training_set(
+        conn, args.season, range(args.train_start, args.train_end + 1)
+    )
+    print(f"  {len(train_features)} (player, gameweek) rows")
+
+    print(f"Building held-out set: {args.season} GW{args.test_start}-{args.test_end}...")
+    test_features, test_targets = training_data.build_training_set(
+        conn, args.season, range(args.test_start, args.test_end + 1)
+    )
+    print(f"  {len(test_features)} (player, gameweek) rows")
+    conn.close()
+
+    if train_features.empty or test_features.empty:
+        raise SystemExit("Not enough data to train/evaluate — check the season and gameweek ranges.")
+
+    ensemble = EnsemblePredictor()
+    results = {}
+    for name, predictor in [("naive", NaivePredictor()), ("poisson", PoissonPredictor()), ("gbm_ensemble", ensemble)]:
+        predictor.fit(train_features, train_targets)
+        predictions = predictor.predict(test_features)
+        merged = predictions.merge(test_targets[["player_id", "gameweek", "total_points"]], on=["player_id", "gameweek"])
+        results[name] = (merged["expected_points"] - merged["total_points"]).abs().mean()
+
+    print(f"\nMean Absolute Error on GW{args.test_start}-{args.test_end} (lower is better):")
+    for name, mae in sorted(results.items(), key=lambda kv: kv[1]):
+        print(f"  {name}: {mae:.3f}")
+
+    if args.save:
+        DEFAULT_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        model_path = DEFAULT_MODELS_DIR / f"gbm_ensemble_{args.season}.joblib"
+        joblib.dump(ensemble, model_path)
+        print(f"\nSaved trained ensemble -> {model_path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fpl-optimizer")
     parser.add_argument("--db-path", type=Path, default=DEFAULT_DB_PATH)
@@ -170,6 +213,17 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_cmd.add_argument("--as-of", default=None, help="ISO date; defaults to today.")
     recommend_cmd.add_argument("--model", choices=sorted(PREDICTORS), default="poisson")
     recommend_cmd.set_defaults(func=_cmd_recommend)
+
+    train_cmd = subparsers.add_parser(
+        "train", help="Train the GBM ensemble on a gameweek range; compare MAE against baselines on a held-out range."
+    )
+    train_cmd.add_argument("--season", required=True, help="e.g. 2024-25")
+    train_cmd.add_argument("--train-start", type=int, required=True)
+    train_cmd.add_argument("--train-end", type=int, required=True)
+    train_cmd.add_argument("--test-start", type=int, required=True)
+    train_cmd.add_argument("--test-end", type=int, required=True)
+    train_cmd.add_argument("--save", action="store_true", help="Persist the trained ensemble to data/artifacts/models/.")
+    train_cmd.set_defaults(func=_cmd_train)
 
     return parser
 

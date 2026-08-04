@@ -211,3 +211,28 @@ change — a reminder of a real limitation already documented in PRD §6a.4 and 
 per-gameweek history): the optimizer can only price a squad as of the one date the archive
 happens to give it a price for. Own-snapshot-sourced seasons (the live 2026-27 season,
 going forward) won't have this limitation once enough daily snapshots accumulate.
+
+---
+
+## 12. HistGradientBoosting crashes outright on an entirely-NaN feature column
+
+**When:** First live run of `fpl-optimizer train` against real 2024-25 data (M3, the GBM
+ensemble).
+**Found by:** Running it — crashed with `ValueError: window shape cannot be larger than
+input array shape`, deep in sklearn's histogram-binning code, on the very first attempt.
+**What happened:** Our real Understat coverage for 2024-25 is almost nonexistent (only 5
+players were ever fetched, via the earlier `--max-players 5` demo, and the sandbox's
+fictional-data mismatch — entry #9 — meant only 1 row actually resolved). Nine xG/xA/xGI
+feature columns were consequently 100% NaN across the entire training set. sklearn's
+`HistGradientBoosting*` handles *some* missing values natively (that's exactly why it was
+chosen over needing an imputation step — Architecture §4.4), but an entirely-empty column
+isn't "some missing values", it's zero data points to bin, and the binning step raises
+rather than skipping it.
+**Why this isn't specific to this dataset:** any thin data source — Understat coverage in
+a brand-new season, a feature that's only just been added — would hit the identical wall.
+**Fix:** Added `usable_columns()` (models/base.py): columns are checked for at least 2
+distinct non-null values *within the specific training subset they'll be fit on* (not just
+globally — `PointsModel` fits two independent regressors on different row subsets, and a
+column can be fine overall but degenerate within just one of those slices) before being
+handed to sklearn. The selected column set is stored at fit time and reused at predict
+time, so train/predict never see a mismatched schema.

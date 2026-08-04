@@ -29,6 +29,14 @@ fpl-optimizer recommend --season 2024-25 --gameweek 20 --model poisson  # predic
 modelled from xG/xA/team defense, scored by real FPL position rules). Both are permanent
 baselines to compare a real model against, not scaffolding (Architecture §4.4).
 
+```bash
+fpl-optimizer train --season 2024-25 --train-start 2 --train-end 27 --test-start 28 --test-end 38 --save
+```
+
+Trains the GBM ensemble (P(minutes) x E[points|plays], per Architecture §4.4) on one
+gameweek range and reports MAE against both baselines on a held-out range. `--save`
+persists the trained model to `data/artifacts/models/`.
+
 Planned, not yet implemented (see milestones in the PRD):
 
 ```bash

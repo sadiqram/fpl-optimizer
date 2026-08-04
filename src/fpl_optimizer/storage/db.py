@@ -265,6 +265,18 @@ def get_player_gw_stats_before(conn: sqlite3.Connection, season: str, gameweek: 
     return cursor.fetchall()
 
 
+def get_player_gw_stats_for_gameweek(conn: sqlite3.Connection, season: str, gameweek: int) -> list[sqlite3.Row]:
+    """Outcome rows AT exactly `gameweek` — the training *label* when fitting a model, not
+    a feature. Using ground truth as a regression target is correct and standard; the
+    leakage boundary (get_player_gw_stats_before) is about what a model may see as *input*
+    at prediction time, which is a different question from what we train it to predict."""
+    cursor = conn.execute(
+        "SELECT * FROM player_gw_stats WHERE season = ? AND gameweek = ?",
+        (season, gameweek),
+    )
+    return cursor.fetchall()
+
+
 def get_understat_player_gw_before(conn: sqlite3.Connection, season: str, gameweek: int) -> list[sqlite3.Row]:
     cursor = conn.execute(
         "SELECT * FROM understat_player_gw WHERE season = ? AND gameweek < ? ORDER BY gameweek",
