@@ -350,17 +350,24 @@ def get_player_snapshots_as_of(conn: sqlite3.Connection, as_of_date: str) -> lis
     return cursor.fetchall()
 
 
-def insert_event_live_stats(conn: sqlite3.Connection, elements: list[dict], season: str, gameweek: int) -> int:
-    """`elements`: the raw `event/{id}/live/` response's "elements" list —
-    [{"id": <this season's element id>, "stats": {...}}]. Maps each element id to the
-    stable player code via players.element_id (the live season's current mapping — same
-    identity gotcha as everywhere else, error_log.md #2) and writes into player_gw_stats
-    with source='fpl_api'. Elements whose id isn't a currently-known live player are
-    skipped rather than raising (NFR2). Returns the number of rows written."""
-    element_to_player = {
+def get_element_id_to_player_id_map(conn: sqlite3.Connection) -> dict[int, int]:
+    """The live season's current element_id -> stable player code mapping (same identity
+    gotcha as everywhere else, error_log.md #2) — shared by any ingestion path that has to
+    translate a season-specific FPL element id (event/live/, entry/picks/, entry/transfers/)
+    back to our stable player_id."""
+    return {
         row["element_id"]: row["id"]
         for row in conn.execute("SELECT id, element_id FROM players WHERE element_id IS NOT NULL")
     }
+
+
+def insert_event_live_stats(conn: sqlite3.Connection, elements: list[dict], season: str, gameweek: int) -> int:
+    """`elements`: the raw `event/{id}/live/` response's "elements" list —
+    [{"id": <this season's element id>, "stats": {...}}]. Maps each element id to the
+    stable player code via players.element_id and writes into player_gw_stats with
+    source='fpl_api'. Elements whose id isn't a currently-known live player are skipped
+    rather than raising (NFR2). Returns the number of rows written."""
+    element_to_player = get_element_id_to_player_id_map(conn)
 
     def _num(value):
         # Same "None" spelled as a literal string pitfall as archive CSVs (error_log.md #10).
@@ -462,3 +469,105 @@ def insert_recommendation(
         (run_id, created_at, season, gameweek, json.dumps(payload)),
     )
     conn.commit()
+
+
+def insert_squad_transfers(conn: sqlite3.Connection, rows: list[dict]) -> None:
+    """rows: raw `entry/{id}/transfers/` items — element_in, element_in_cost, element_out,
+    element_out_cost, event, time. Doesn't include the season-opening 15 (schema.sql's own
+    comment on this table) — those are resolved from the earliest own_snapshot instead, see
+    squad_state.resolve_purchase_price. Upsert on (element_in, element_out, time) — FPL never
+    returns the same transfer twice, but re-running `squad` on the same history must not
+    duplicate rows."""
+    conn.executemany(
+        """
+        INSERT INTO squad_transfers (event, element_in, element_in_cost, element_out, element_out_cost, time)
+        VALUES (:event, :element_in, :element_in_cost, :element_out, :element_out_cost, :time)
+        ON CONFLICT(element_in, element_out, time) DO UPDATE SET
+            event = excluded.event,
+            element_in_cost = excluded.element_in_cost,
+            element_out_cost = excluded.element_out_cost
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def get_squad_transfers_in(conn: sqlite3.Connection, player_id: int) -> list[sqlite3.Row]:
+    """Every transfer that brought `player_id` into the squad, most recent first — used to
+    resolve their purchase price (the most recent element_in_cost, since a player sold and
+    re-bought later has a new purchase price)."""
+    cursor = conn.execute(
+        "SELECT * FROM squad_transfers WHERE element_in = ? ORDER BY time DESC", (player_id,)
+    )
+    return cursor.fetchall()
+
+
+def get_earliest_own_snapshot_price(conn: sqlite3.Connection, player_id: int) -> int | None:
+    """A player's price at the earliest own_snapshot on record — the fallback purchase price
+    for someone held since the season-opening 15, who never appears in squad_transfers
+    (schema.sql's comment on that table; Architecture "M1 urgency" note is why this is only
+    approximate for a squad assembled before daily snapshotting started)."""
+    row = conn.execute(
+        """
+        SELECT now_cost FROM player_snapshots
+        WHERE player_id = ? AND source = 'own_snapshot' AND now_cost IS NOT NULL
+        ORDER BY snapshot_date ASC LIMIT 1
+        """,
+        (player_id,),
+    ).fetchone()
+    return row["now_cost"] if row else None
+
+
+def insert_owned_squad(conn: sqlite3.Connection, rows: list[dict], season: str, gameweek: int, recorded_at: str) -> None:
+    """rows: {player_id, is_starting, is_captain, is_vice_captain, purchase_price}. One
+    snapshot per (season, gameweek) — re-running `squad` for the same locked gameweek
+    updates in place rather than duplicating."""
+    payload = [
+        {**row, "season": season, "gameweek": gameweek, "recorded_at": recorded_at} for row in rows
+    ]
+    conn.executemany(
+        """
+        INSERT INTO owned_squad (season, gameweek, player_id, is_starting, is_captain, is_vice_captain, purchase_price, recorded_at)
+        VALUES (:season, :gameweek, :player_id, :is_starting, :is_captain, :is_vice_captain, :purchase_price, :recorded_at)
+        ON CONFLICT(season, gameweek, player_id) DO UPDATE SET
+            is_starting = excluded.is_starting,
+            is_captain = excluded.is_captain,
+            is_vice_captain = excluded.is_vice_captain,
+            purchase_price = excluded.purchase_price,
+            recorded_at = excluded.recorded_at
+        """,
+        payload,
+    )
+    conn.commit()
+
+
+def get_owned_squad(conn: sqlite3.Connection, season: str, gameweek: int) -> list[sqlite3.Row]:
+    cursor = conn.execute(
+        "SELECT * FROM owned_squad WHERE season = ? AND gameweek = ?", (season, gameweek)
+    )
+    return cursor.fetchall()
+
+
+def insert_team_state(
+    conn: sqlite3.Connection, season: str, gameweek: int, bank: int | None,
+    free_transfers: int, chips_available: list[str], recorded_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO team_state (season, gameweek, bank, free_transfers, chips_available, recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(season, gameweek) DO UPDATE SET
+            bank = excluded.bank,
+            free_transfers = excluded.free_transfers,
+            chips_available = excluded.chips_available,
+            recorded_at = excluded.recorded_at
+        """,
+        (season, gameweek, bank, free_transfers, json.dumps(chips_available), recorded_at),
+    )
+    conn.commit()
+
+
+def get_team_state(conn: sqlite3.Connection, season: str, gameweek: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM team_state WHERE season = ? AND gameweek = ?", (season, gameweek)
+    ).fetchone()

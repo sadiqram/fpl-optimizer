@@ -24,7 +24,7 @@ from fpl_optimizer.models.baseline import NaivePredictor, PoissonPredictor
 from fpl_optimizer.models.ensemble import EnsemblePredictor
 from fpl_optimizer.optimize import constraints
 from fpl_optimizer.storage import db
-from fpl_optimizer.strategy import horizon
+from fpl_optimizer.strategy import horizon, squad_state
 
 PREDICTORS = {"naive": NaivePredictor, "poisson": PoissonPredictor}
 MODEL_CHOICES = [*sorted(PREDICTORS), "gbm"]
@@ -89,6 +89,75 @@ def _cmd_bootstrap_season(args: argparse.Namespace) -> None:
     print(f"Bootstrapped {args.season} from the vaastav archive:")
     for key, value in summary.items():
         print(f"  {key}: {value}")
+
+
+def _cmd_squad(args: argparse.Namespace) -> None:
+    """Owned-squad state ingestion (M6, FR1): current squad, purchase prices, free
+    transfers, chip status — the state `plan` needs and has never existed anywhere in the
+    app until now (squad_transfers has sat empty in the schema since M1)."""
+    load_dotenv()
+    team_id = os.environ.get("FPL_TEAM_ID", "").strip()
+    if not team_id:
+        raise SystemExit("FPL_TEAM_ID not set in .env — required for `squad`.")
+    team_id = int(team_id)
+
+    client = FPLClient()
+    now = datetime.now(timezone.utc)
+
+    history = client.entry_history(team_id)
+    save_raw("fpl_api", f"entry-{team_id}-history", history, when=now)
+
+    if not history["current"]:
+        # NFR2: the season hasn't started yet (no gameweek has locked for this team) — there
+        # is no "current squad" to report. Not an error, just nothing to do yet.
+        raise SystemExit(f"No locked gameweeks yet for team {team_id} — the season hasn't started.")
+
+    last_locked_gw = max(row["event"] for row in history["current"])
+    last_locked_row = next(row for row in history["current"] if row["event"] == last_locked_gw)
+
+    transfers = client.entry_transfers(team_id)
+    save_raw("fpl_api", f"entry-{team_id}-transfers", transfers, when=now)
+
+    picks = client.entry_picks(team_id, last_locked_gw)
+    save_raw("fpl_api", f"entry-{team_id}-picks-gw{last_locked_gw}", picks, when=now)
+
+    conn = db.connect(args.db_path)
+
+    db.insert_squad_transfers(conn, [
+        {
+            "event": t["event"], "element_in": t["element_in"], "element_in_cost": t["element_in_cost"],
+            "element_out": t["element_out"], "element_out_cost": t["element_out_cost"], "time": t["time"],
+        }
+        for t in transfers
+    ])
+
+    element_to_player = db.get_element_id_to_player_id_map(conn)
+    owned_rows = []
+    for pick in picks["picks"]:
+        player_id = element_to_player.get(pick["element"])
+        if player_id is None:
+            continue  # NFR2: an unrecognized element id shouldn't crash the whole ingest
+        owned_rows.append({
+            "player_id": player_id,
+            "is_starting": int(pick["position"] <= 11),
+            "is_captain": int(pick["is_captain"]),
+            "is_vice_captain": int(pick["is_vice_captain"]),
+            "purchase_price": squad_state.resolve_purchase_price(conn, player_id, args.season),
+        })
+    db.insert_owned_squad(conn, owned_rows, season=args.season, gameweek=last_locked_gw, recorded_at=now.isoformat())
+
+    free_transfers = squad_state.compute_free_transfers(history["current"], history["chips"])
+    chips_available = squad_state.resolve_chips_available(history["chips"])
+    db.insert_team_state(
+        conn, season=args.season, gameweek=last_locked_gw + 1, bank=last_locked_row.get("bank"),
+        free_transfers=free_transfers, chips_available=chips_available, recorded_at=now.isoformat(),
+    )
+    conn.close()
+
+    print(f"Squad state for team {team_id}, {args.season}, as of GW{last_locked_gw}:")
+    print(f"  {len(owned_rows)} players, bank {(last_locked_row.get('bank') or 0) / 10:.1f}m")
+    print(f"  Free transfers available for GW{last_locked_gw + 1}: {free_transfers}")
+    print(f"  Chips available: {', '.join(chips_available) or 'none'}")
 
 
 def _cmd_understat(args: argparse.Namespace) -> None:
@@ -351,6 +420,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bootstrap_season.add_argument("--season", required=True, help="e.g. 2024-25")
     bootstrap_season.set_defaults(func=_cmd_bootstrap_season)
+
+    squad_cmd = subparsers.add_parser(
+        "squad", help="Pull owned squad, selling prices, free transfers, chip status for FPL_TEAM_ID (M6, FR1)."
+    )
+    squad_cmd.add_argument("--season", required=True, help="e.g. 2026-27")
+    squad_cmd.set_defaults(func=_cmd_squad)
 
     understat_cmd = subparsers.add_parser(
         "understat", help="Fetch live Understat data for a season and match it to FPL players."

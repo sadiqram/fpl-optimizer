@@ -29,3 +29,21 @@ XI_SIZE = 11
 # legal FPL formation (3-4-3 through 5-4-1 etc.) without allowing an invalid one.
 XI_POSITION_MIN = {1: 1, 2: 3, 3: 2, 4: 1}
 XI_POSITION_MAX = {1: 1, 2: 5, 3: 5, 4: 3}
+
+# Free-transfer banking cap (M6). Current rule as of the 2024-25 season change noted above
+# in BUDGET's comment; was 2 before that. One place to update if it changes again.
+FREE_TRANSFER_CAP = 5
+
+# Points deducted per transfer beyond the free ones available that gameweek.
+HIT_COST = 4
+
+
+def selling_price(purchase_price: int, current_price: int) -> int:
+    """FPL's actual rule (Architecture §4.5 "On selling price"): a price *drop* is absorbed
+    in full (you sell at current_price), but only half of any *rise* is recouped, rounded
+    down. Both prices are 0.1m-unit integers already, so `// 2` needs no extra rounding.
+    A naive optimizer using current market price for owned players hallucinates budget that
+    doesn't exist — this is what prevents that."""
+    if current_price <= purchase_price:
+        return current_price
+    return purchase_price + (current_price - purchase_price) // 2

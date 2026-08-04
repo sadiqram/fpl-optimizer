@@ -171,3 +171,31 @@ CREATE TABLE IF NOT EXISTS squad_transfers (
     time             TEXT NOT NULL,
     UNIQUE (element_in, element_out, time)
 );
+
+-- Owned-squad snapshots (M6, FR1) — point-in-time, same spirit as player_snapshots.
+-- `gameweek` is the last-locked gameweek this snapshot reflects (entry/{id}/event/{gw}/picks/
+-- 404s before its own deadline passes, so "current squad" is always as-of the previous lock).
+CREATE TABLE IF NOT EXISTS owned_squad (
+    season           TEXT NOT NULL,
+    gameweek         INTEGER NOT NULL,
+    player_id        INTEGER NOT NULL REFERENCES players(id),
+    is_starting      INTEGER NOT NULL,
+    is_captain       INTEGER NOT NULL,
+    is_vice_captain  INTEGER NOT NULL,
+    purchase_price   INTEGER,  -- 0.1m units; NULL if unresolved (see squad_state.resolve_purchase_price)
+    recorded_at      TEXT NOT NULL,
+    PRIMARY KEY (season, gameweek, player_id)
+);
+
+-- Derived team state (M6, FR1) — bank/free transfers/chips, computed once at `squad` ingest
+-- time (banking-rule simulation + chip-history lookup) rather than re-derived on every
+-- `plan` run. `gameweek` is the upcoming/undecided gameweek this state applies to.
+CREATE TABLE IF NOT EXISTS team_state (
+    season           TEXT NOT NULL,
+    gameweek         INTEGER NOT NULL,
+    bank             INTEGER,  -- 0.1m units
+    free_transfers   INTEGER,
+    chips_available  TEXT,     -- JSON list, e.g. ["wildcard","bboost","3xc","freehit"]
+    recorded_at      TEXT NOT NULL,
+    PRIMARY KEY (season, gameweek)
+);
