@@ -1,0 +1,35 @@
+# Runtime config — hyperparameters, horizon, decay, thresholds. Secrets (FPL_TEAM_ID) live in .env, not here.
+# Placeholder values below are untuned; calibrate via the backtesting harness (PRD M4).
+
+horizon:
+  gameweeks: 5
+  decay: [1.0, 0.8, 0.6, 0.45, 0.3]  # PRD §6a.1 starting point
+
+transfers:
+  hit_threshold: -4  # points a transfer must clear to be worth a -4 hit (PRD FR3)
+
+risk:
+  # v1 ships the manual writer only (PRD §6a.2). Set a preset name, or override `risk` directly.
+  default_preset: balanced
+
+presets:
+  balanced:
+    risk: 0.0
+    variance_penalty: 0.0
+    ownership_bonus: 0.0
+    value_bonus: 0.0
+  safe:
+    risk: -0.5
+    variance_penalty: 0.3
+    ownership_bonus: 0.0
+    value_bonus: 0.0
+  aggressive:
+    risk: 0.5
+    variance_penalty: 0.0
+    ownership_bonus: 0.2
+    value_bonus: 0.0
+  value_conscious:
+    risk: 0.0
+    variance_penalty: 0.0
+    ownership_bonus: 0.0
+    value_bonus: 0.15

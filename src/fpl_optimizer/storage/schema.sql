@@ -1,0 +1,4 @@
+-- SQLite schema (Architecture §4.2). Forward-only migrations; no down-migrations.
+-- Tables: players, player_gw_stats, player_snapshots, fixtures, team_stats,
+-- understat_player_gw, predictions, recommendations, player_id_map.
+-- DDL to be written alongside the storage layer in M1.
