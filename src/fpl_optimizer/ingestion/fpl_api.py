@@ -46,3 +46,10 @@ class FPLClient:
     def element_summary(self, player_id: int) -> dict:
         """Per-fixture and per-gameweek history for one player, plus prior-season summaries."""
         return self._get(f"element-summary/{player_id}/")
+
+    def event_live(self, event: int) -> dict:
+        """Actual per-player stats for one gameweek — {"elements": [{"id": <element_id>,
+        "stats": {...}}]}. This is the real outcome (minutes, total_points, goals, ...),
+        as opposed to bootstrap_static's current-state view; used by `results` to log what
+        actually happened against what was predicted (PRD M5)."""
+        return self._get(f"event/{event}/live/")

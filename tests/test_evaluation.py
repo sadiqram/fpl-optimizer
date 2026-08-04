@@ -33,6 +33,15 @@ def test_mae_rmse_by_position():
     assert result.loc[3, "n"] == 2
 
 
+def test_overall_mae_rmse():
+    predictions = pd.DataFrame({"player_id": [1, 2, 3], "expected_points": [5.0, 3.0, 2.0]})
+    actuals = pd.DataFrame({"player_id": [1, 2, 3], "total_points": [7.0, 3.0, 6.0]})
+    result = metrics.overall_mae_rmse(predictions, actuals)
+    assert result["n"] == 3
+    assert result["mae"] == pytest.approx((2.0 + 0.0 + 4.0) / 3)
+    assert result["rmse"] == pytest.approx(((2.0**2 + 0.0**2 + 4.0**2) / 3) ** 0.5)
+
+
 def test_squad_selection_regret():
     assert metrics.squad_selection_regret(recommended_squad_actual_points=50, hindsight_squad_actual_points=65) == 15
     assert metrics.squad_selection_regret(recommended_squad_actual_points=50, hindsight_squad_actual_points=50) == 0

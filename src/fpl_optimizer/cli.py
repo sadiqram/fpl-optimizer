@@ -1,9 +1,10 @@
-"""CLI entry point. `ingest` is the first subcommand (M1); recommend/backtest/evaluate land in later milestones (Architecture §4.7)."""
+"""CLI entry point (Architecture §4.7)."""
 
 from __future__ import annotations
 
 import argparse
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,7 +14,7 @@ import joblib
 import pandas as pd
 
 from fpl_optimizer import clock
-from fpl_optimizer.evaluation import backtest
+from fpl_optimizer.evaluation import backtest, metrics
 from fpl_optimizer.features import build as feature_build
 from fpl_optimizer.ingestion import archive_loader, understat
 from fpl_optimizer.ingestion.fpl_api import FPLClient
@@ -26,9 +27,11 @@ from fpl_optimizer.storage import db
 from fpl_optimizer.strategy import horizon
 
 PREDICTORS = {"naive": NaivePredictor, "poisson": PoissonPredictor}
+MODEL_CHOICES = [*sorted(PREDICTORS), "gbm"]
 
 DEFAULT_DB_PATH = Path("data/db/fpl.sqlite")
 DEFAULT_MODELS_DIR = Path("data/artifacts/models")
+ACCURACY_LOG_PATH = Path("data/artifacts/evaluation/accuracy_log.csv")
 
 
 def infer_current_season(bootstrap: dict) -> str:
@@ -52,8 +55,7 @@ def _cmd_ingest(args: argparse.Namespace) -> None:
     fixtures = client.fixtures()
     save_raw("fpl_api", "fixtures", fixtures, when=now)
 
-    conn = db.connect(args.db_path)
-    db.init_db(conn)
+    conn = db.connect(args.db_path)  # connect() already ensures the schema is current
     db.upsert_teams(conn, bootstrap["teams"])
     db.upsert_element_types(conn, bootstrap["element_types"])
     db.upsert_players(conn, bootstrap["elements"], updated_at=now.isoformat())
@@ -107,12 +109,28 @@ def _cmd_features(args: argparse.Namespace) -> None:
     print(f"Built features for {args.season} GW{args.gameweek} as of {as_of_date}: {len(df)} players -> {path}")
 
 
+def _load_predictor(args: argparse.Namespace):
+    """Baselines are stateless (fit() is a documented no-op); gbm loads a joblib model
+    already trained and saved by `train --save` — recommend never trains inline, training
+    is a separate lifecycle stage (strategy.horizon's own docstring)."""
+    if args.model == "gbm":
+        model_path = DEFAULT_MODELS_DIR / f"gbm_ensemble_{args.season}.joblib"
+        if not model_path.exists():
+            raise SystemExit(
+                f"No saved GBM model for {args.season} at {model_path} — "
+                f"run `fpl-optimizer train --season {args.season} ... --save` first."
+            )
+        return joblib.load(model_path)
+    predictor = PREDICTORS[args.model]()
+    predictor.fit(pd.DataFrame())
+    return predictor
+
+
 def _cmd_recommend(args: argparse.Namespace) -> None:
     conn = db.connect(args.db_path)
     the_clock = clock.FixedClock(args.as_of) if args.as_of else clock.SystemClock()
 
-    predictor = PREDICTORS[args.model]()
-    predictor.fit(pd.DataFrame())  # baselines are stateless; fit() is a documented no-op
+    predictor = _load_predictor(args)
 
     result = horizon.recommend_gameweek(conn, the_clock, args.season, args.gameweek, predictor)
     usable = result["predictions"].dropna(subset=["element_type", "team_id", "now_cost", "expected_points"])
@@ -120,12 +138,41 @@ def _cmd_recommend(args: argparse.Namespace) -> None:
     squad_df, picked = result["squad"], result["lineup"]
 
     names = {r["id"]: r["web_name"] for r in conn.execute("SELECT id, web_name FROM players").fetchall()}
-    conn.close()
 
     def label(player_id: int) -> str:
         pts = usable.loc[usable.player_id == player_id, "expected_points"].iloc[0]
         tag = " (C)" if player_id == picked["captain"] else " (VC)" if player_id == picked["vice_captain"] else ""
         return f"{names.get(player_id, f'#{player_id}')}{tag} — {pts:.1f} xPts"
+
+    def player_summary(player_id: int) -> dict:
+        pts = usable.loc[usable.player_id == player_id, "expected_points"].iloc[0]
+        return {"player_id": player_id, "name": names.get(player_id, f"#{player_id}"), "expected_points": float(pts)}
+
+    # Log every prediction and every recommendation made (FR6, Architecture P3) — this is
+    # the data `evaluate` later joins against real outcomes.
+    prediction_rows = usable[["player_id", "expected_points", "p_start", "std_dev"]].to_dict("records")
+    db.insert_predictions(
+        conn, prediction_rows, model_version=args.model, season=args.season,
+        gameweek=args.gameweek, run_date=result["as_of_date"],
+    )
+    run_id = uuid.uuid4().hex
+    payload = {
+        "season": args.season,
+        "gameweek": args.gameweek,
+        "model": args.model,
+        "as_of_date": result["as_of_date"],
+        "squad_cost": float(squad_df["now_cost"].sum()),
+        "squad_expected_points": float(squad_df["expected_points"].sum()),
+        "starting_xi": [player_summary(pid) for pid in picked["starting_xi"]],
+        "bench": [player_summary(pid) for pid in picked["bench"]],
+        "captain": player_summary(picked["captain"]),
+        "vice_captain": player_summary(picked["vice_captain"]),
+    }
+    db.insert_recommendation(
+        conn, run_id, created_at=datetime.now(timezone.utc).isoformat(),
+        season=args.season, gameweek=args.gameweek, payload=payload,
+    )
+    conn.close()
 
     print(f"Recommendation for {args.season} GW{args.gameweek} ({args.model} model, as of {result['as_of_date']})")
     if dropped:
@@ -138,6 +185,7 @@ def _cmd_recommend(args: argparse.Namespace) -> None:
     print("  Bench:")
     for player_id in picked["bench"]:
         print(f"    {label(player_id)}")
+    print(f"\n  Logged {len(prediction_rows)} predictions and recommendation {run_id} for later `evaluate`.")
 
 
 def _cmd_train(args: argparse.Namespace) -> None:
@@ -208,6 +256,88 @@ def _cmd_backtest(args: argparse.Namespace) -> None:
     print(results.to_string(index=False))
 
 
+def _cmd_results(args: argparse.Namespace) -> None:
+    """Ingestion step (fetch + write raw snapshot + parse, never transform beyond that —
+    Architecture §4.1): pulls actual per-player outcomes for one live gameweek and stores
+    them in player_gw_stats, same as archive/understat ingestion does for their sources.
+    `evaluate` reads from the DB, not the network, so this has to run first for a live
+    season (archive-bootstrapped seasons already have player_gw_stats populated)."""
+    conn = db.connect(args.db_path)
+    client = FPLClient()
+    now = datetime.now(timezone.utc)
+
+    live = client.event_live(args.gameweek)
+    save_raw("fpl_api", f"event-{args.gameweek}-live", live, when=now)
+    n = db.insert_event_live_stats(conn, live["elements"], season=args.season, gameweek=args.gameweek)
+    conn.close()
+
+    print(f"Ingested results for {args.season} GW{args.gameweek}: {n} players.")
+
+
+def _append_accuracy_log(rows: list[dict]) -> None:
+    """Appends one summary row per model to the running accuracy log (Architecture §4.8) —
+    the persisted trend line `evaluate` builds up over a season. Re-evaluating the same
+    (season, gameweek, model_version) updates that row in place rather than duplicating.
+    """
+    ACCURACY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    new_rows = pd.DataFrame(rows)
+    key = ["season", "gameweek", "model_version"]
+    if ACCURACY_LOG_PATH.exists():
+        existing = pd.read_csv(ACCURACY_LOG_PATH)
+        existing = existing[~existing.set_index(key).index.isin(new_rows.set_index(key).index)]
+        combined = pd.concat([existing, new_rows], ignore_index=True)
+    else:
+        combined = new_rows
+    combined.sort_values(key).to_csv(ACCURACY_LOG_PATH, index=False)
+    print(f"\nAppended to {ACCURACY_LOG_PATH}")
+
+
+def _cmd_evaluate(args: argparse.Namespace) -> None:
+    conn = db.connect(args.db_path)
+    predictions = db.get_latest_predictions(conn, args.season, args.gameweek, model_version=args.model)
+    actual_rows = db.get_player_gw_stats_for_gameweek(conn, args.season, args.gameweek)
+    # element_type isn't stored on predictions (it's a slowly-changing player attribute,
+    # not part of a prediction) — fetched separately for the by-position breakdown below.
+    element_types = {r["id"]: r["element_type"] for r in conn.execute("SELECT id, element_type FROM players")}
+    conn.close()
+
+    if not predictions:
+        raise SystemExit(
+            f"No logged predictions for {args.season} GW{args.gameweek} — run `fpl-optimizer recommend` for it first."
+        )
+    if not actual_rows:
+        raise SystemExit(
+            f"No recorded results for {args.season} GW{args.gameweek} — run `fpl-optimizer results` for it first."
+        )
+
+    predictions_df = pd.DataFrame([dict(r) for r in predictions])
+    predictions_df["element_type"] = predictions_df["player_id"].map(element_types)
+    actuals_df = pd.DataFrame([dict(r) for r in actual_rows])
+
+    print(f"Evaluation for {args.season} GW{args.gameweek}:")
+    log_rows = []
+    for model_version, group in predictions_df.groupby("model_version"):
+        overall = metrics.overall_mae_rmse(group, actuals_df)
+        print(f"\n  {model_version}: MAE {overall['mae']:.3f}   RMSE {overall['rmse']:.3f}   (n={overall['n']})")
+        print(metrics.mae_rmse_by_position(group, actuals_df).to_string(index=False))
+
+        if group["p_start"].notna().any():
+            print("  Minutes calibration:")
+            print(metrics.minutes_calibration(group, actuals_df).to_string(index=False))
+
+        log_rows.append({
+            "season": args.season,
+            "gameweek": args.gameweek,
+            "model_version": model_version,
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            "n": overall["n"],
+            "mae": overall["mae"],
+            "rmse": overall["rmse"],
+        })
+
+    _append_accuracy_log(log_rows)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fpl-optimizer")
     parser.add_argument("--db-path", type=Path, default=DEFAULT_DB_PATH)
@@ -239,7 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_cmd.add_argument("--season", required=True, help="e.g. 2024-25")
     recommend_cmd.add_argument("--gameweek", type=int, required=True)
     recommend_cmd.add_argument("--as-of", default=None, help="ISO date; defaults to today.")
-    recommend_cmd.add_argument("--model", choices=sorted(PREDICTORS), default="poisson")
+    recommend_cmd.add_argument("--model", choices=MODEL_CHOICES, default="poisson")
     recommend_cmd.set_defaults(func=_cmd_recommend)
 
     train_cmd = subparsers.add_parser(
@@ -259,8 +389,25 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_cmd.add_argument("--season", required=True, help="e.g. 2024-25")
     backtest_cmd.add_argument("--start-gameweek", type=int, required=True)
     backtest_cmd.add_argument("--end-gameweek", type=int, required=True)
-    backtest_cmd.add_argument("--model", choices=[*sorted(PREDICTORS), "gbm"], default="poisson")
+    backtest_cmd.add_argument("--model", choices=MODEL_CHOICES, default="poisson")
     backtest_cmd.set_defaults(func=_cmd_backtest)
+
+    results_cmd = subparsers.add_parser(
+        "results", help="Fetch actual per-player results for a live gameweek and store them (needed before `evaluate`)."
+    )
+    results_cmd.add_argument("--season", required=True, help="e.g. 2026-27")
+    results_cmd.add_argument("--gameweek", type=int, required=True)
+    results_cmd.set_defaults(func=_cmd_results)
+
+    evaluate_cmd = subparsers.add_parser(
+        "evaluate", help="Compare logged predictions against actual results for a gameweek (Architecture §4.8, PRD M5)."
+    )
+    evaluate_cmd.add_argument("--season", required=True, help="e.g. 2024-25")
+    evaluate_cmd.add_argument("--gameweek", type=int, required=True)
+    evaluate_cmd.add_argument(
+        "--model", choices=MODEL_CHOICES, default=None, help="Filter to one model; default compares all logged models."
+    )
+    evaluate_cmd.set_defaults(func=_cmd_evaluate)
 
     return parser
 

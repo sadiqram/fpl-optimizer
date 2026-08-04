@@ -1,5 +1,6 @@
 """Storage layer: schema init, upserts, and the as-of query boundary (Architecture §4.2-4.3)."""
 
+import json
 import sqlite3
 
 import pytest
@@ -97,6 +98,79 @@ def test_players_keyed_by_code_not_reused_season_element_id(conn):
     rows = conn.execute("SELECT id, second_name FROM players ORDER BY id").fetchall()
     assert len(rows) == 2
     assert {r["second_name"] for r in rows} == {"Salah", "OtherPlayer"}
+
+
+def test_insert_predictions_upserts_same_run(conn):
+    _seed_one_player(conn)
+    db.insert_predictions(
+        conn, [{"player_id": 123, "expected_points": 5.0, "p_start": 0.9, "std_dev": 2.0}],
+        model_version="poisson", season="2025-26", gameweek=3, run_date="2025-09-01",
+    )
+    db.insert_predictions(
+        conn, [{"player_id": 123, "expected_points": 6.5, "p_start": 0.95, "std_dev": 2.1}],
+        model_version="poisson", season="2025-26", gameweek=3, run_date="2025-09-01",
+    )
+    rows = conn.execute("SELECT * FROM predictions").fetchall()
+    assert len(rows) == 1  # same (model_version, season, player_id, gameweek, run_date) -> update, not duplicate
+    assert rows[0]["expected_points"] == pytest.approx(6.5)
+
+
+def test_get_latest_predictions_picks_most_recent_run_date(conn):
+    _seed_one_player(conn)
+    db.insert_predictions(
+        conn, [{"player_id": 123, "expected_points": 4.0, "p_start": 0.8, "std_dev": 2.0}],
+        model_version="poisson", season="2025-26", gameweek=3, run_date="2025-08-28",
+    )
+    db.insert_predictions(
+        conn, [{"player_id": 123, "expected_points": 7.0, "p_start": 0.9, "std_dev": 2.0}],
+        model_version="poisson", season="2025-26", gameweek=3, run_date="2025-09-01",
+    )
+    latest = db.get_latest_predictions(conn, "2025-26", 3)
+    assert len(latest) == 1
+    assert latest[0]["expected_points"] == pytest.approx(7.0)
+    assert latest[0]["run_date"] == "2025-09-01"
+
+
+def test_get_latest_predictions_filters_by_model_version(conn):
+    _seed_one_player(conn)
+    db.insert_predictions(
+        conn, [{"player_id": 123, "expected_points": 4.0, "p_start": 0.8, "std_dev": 2.0}],
+        model_version="naive", season="2025-26", gameweek=3, run_date="2025-09-01",
+    )
+    db.insert_predictions(
+        conn, [{"player_id": 123, "expected_points": 7.0, "p_start": 0.9, "std_dev": 2.0}],
+        model_version="poisson", season="2025-26", gameweek=3, run_date="2025-09-01",
+    )
+    assert len(db.get_latest_predictions(conn, "2025-26", 3)) == 2
+    only_naive = db.get_latest_predictions(conn, "2025-26", 3, model_version="naive")
+    assert len(only_naive) == 1
+    assert only_naive[0]["model_version"] == "naive"
+
+
+def test_insert_recommendation_roundtrip(conn):
+    payload = {"squad_expected_points": 65.5, "captain": {"player_id": 1}}
+    db.insert_recommendation(conn, "run-1", created_at="2025-09-01T12:00:00Z", season="2025-26", gameweek=3, payload=payload)
+    row = conn.execute("SELECT * FROM recommendations WHERE run_id = 'run-1'").fetchone()
+    assert row["season"] == "2025-26"
+    assert json.loads(row["payload"]) == payload
+
+
+def test_insert_event_live_stats_maps_element_id_and_skips_unmapped(conn):
+    _seed_one_player(conn)  # players.id (code) = 123, element_id = 1 (the "id" field passed to upsert_players)
+    elements = [
+        {"id": 1, "stats": {
+            "minutes": 90, "total_points": 8, "goals_scored": 1, "assists": 0, "clean_sheets": 1,
+            "goals_conceded": 0, "bonus": 2, "bps": 30, "expected_goals": "0.45", "expected_assists": "None",
+        }},
+        {"id": 999999, "stats": {"minutes": 90, "total_points": 3}},  # no matching player -> skipped
+    ]
+    n = db.insert_event_live_stats(conn, elements, season="2025-26", gameweek=3)
+    assert n == 1
+    row = conn.execute("SELECT * FROM player_gw_stats WHERE player_id = 123 AND gameweek = 3").fetchone()
+    assert row["total_points"] == 8
+    assert row["expected_goals"] == pytest.approx(0.45)
+    assert row["expected_assists"] is None
+    assert row["source"] == "fpl_api"
 
 
 def test_archive_upsert_never_clobbers_live_element_id(conn):

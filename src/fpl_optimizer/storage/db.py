@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -9,10 +10,17 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
 def connect(db_path: Path | str) -> sqlite3.Connection:
+    """Every caller gets a schema-current connection: init_db's CREATE TABLE/etc. are all
+    IF NOT EXISTS, so applying it here on every connect is free once the schema already
+    matches, and self-heals the case that used to crash any command but `ingest` — a DB
+    predating a schema change (e.g. this file, before `season` was added to `predictions`)
+    would 500 the first time `recommend`/`evaluate`/anything else touched the new table,
+    since only `_cmd_ingest` used to call init_db (docs/error_log.md, M5 entry)."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
+    init_db(conn)
     return conn
 
 
@@ -340,3 +348,117 @@ def get_player_snapshots_as_of(conn: sqlite3.Connection, as_of_date: str) -> lis
         (as_of_date,),
     )
     return cursor.fetchall()
+
+
+def insert_event_live_stats(conn: sqlite3.Connection, elements: list[dict], season: str, gameweek: int) -> int:
+    """`elements`: the raw `event/{id}/live/` response's "elements" list —
+    [{"id": <this season's element id>, "stats": {...}}]. Maps each element id to the
+    stable player code via players.element_id (the live season's current mapping — same
+    identity gotcha as everywhere else, error_log.md #2) and writes into player_gw_stats
+    with source='fpl_api'. Elements whose id isn't a currently-known live player are
+    skipped rather than raising (NFR2). Returns the number of rows written."""
+    element_to_player = {
+        row["element_id"]: row["id"]
+        for row in conn.execute("SELECT id, element_id FROM players WHERE element_id IS NOT NULL")
+    }
+
+    def _num(value):
+        # Same "None" spelled as a literal string pitfall as archive CSVs (error_log.md #10).
+        return float(value) if value not in (None, "", "None", "NA", "nan") else None
+
+    rows = []
+    for element in elements:
+        player_id = element_to_player.get(element["id"])
+        if player_id is None:
+            continue
+        stats = element["stats"]
+        rows.append({
+            "player_id": player_id,
+            "gameweek": gameweek,
+            "minutes": stats.get("minutes"),
+            "total_points": stats.get("total_points"),
+            "goals_scored": stats.get("goals_scored"),
+            "assists": stats.get("assists"),
+            "clean_sheets": stats.get("clean_sheets"),
+            "goals_conceded": stats.get("goals_conceded"),
+            "bonus": stats.get("bonus"),
+            "bps": stats.get("bps"),
+            "expected_goals": _num(stats.get("expected_goals")),
+            "expected_assists": _num(stats.get("expected_assists")),
+        })
+
+    insert_player_gw_stats(conn, rows, source="fpl_api", season=season)
+    return len(rows)
+
+
+def insert_predictions(
+    conn: sqlite3.Connection, rows: list[dict], model_version: str, season: str, gameweek: int, run_date: str
+) -> None:
+    """rows: {player_id, expected_points, p_start, std_dev}. Every prediction ever made is
+    kept (Architecture §4.4 "model versioning") — season is part of the key for the same
+    reason as player_gw_stats: gameweek numbers reset every season. Re-running `recommend`
+    for the same (model_version, season, player, gameweek, run_date) updates in place rather
+    than duplicating, so reruns on the same day don't pile up rows."""
+    payload = [
+        {**row, "model_version": model_version, "season": season, "gameweek": gameweek, "run_date": run_date}
+        for row in rows
+    ]
+    conn.executemany(
+        """
+        INSERT INTO predictions (model_version, season, player_id, gameweek, run_date, expected_points, p_start, std_dev)
+        VALUES (:model_version, :season, :player_id, :gameweek, :run_date, :expected_points, :p_start, :std_dev)
+        ON CONFLICT(model_version, season, player_id, gameweek, run_date) DO UPDATE SET
+            expected_points = excluded.expected_points,
+            p_start = excluded.p_start,
+            std_dev = excluded.std_dev
+        """,
+        payload,
+    )
+    conn.commit()
+
+
+def get_latest_predictions(
+    conn: sqlite3.Connection, season: str, gameweek: int, model_version: str | None = None
+) -> list[sqlite3.Row]:
+    """One row per (model_version, player_id): the most recently logged prediction (by
+    run_date) for that gameweek — if `recommend` was run more than once before a deadline,
+    this is the prediction that was actually live closest to it, not an earlier draft.
+    `model_version=None` returns every logged model's latest predictions, so `evaluate` can
+    compare several models for the same gameweek in one report."""
+    params: list = [season, gameweek]
+    model_filter = ""
+    if model_version is not None:
+        model_filter = "AND model_version = ?"
+        params.append(model_version)
+
+    cursor = conn.execute(
+        f"""
+        SELECT p.* FROM predictions p
+        JOIN (
+            SELECT model_version, player_id, MAX(run_date) AS run_date
+            FROM predictions
+            WHERE season = ? AND gameweek = ? {model_filter}
+            GROUP BY model_version, player_id
+        ) latest
+            ON p.model_version = latest.model_version
+            AND p.player_id = latest.player_id
+            AND p.run_date = latest.run_date
+        WHERE p.season = ? AND p.gameweek = ?
+        """,
+        [*params, season, gameweek],
+    )
+    return cursor.fetchall()
+
+
+def insert_recommendation(
+    conn: sqlite3.Connection, run_id: str, created_at: str, season: str, gameweek: int, payload: dict
+) -> None:
+    """Persists the full recommendation output + rationale as JSON (Architecture §4.2,
+    P3: every intermediate artifact is persisted). One row per run — reruns get a fresh
+    run_id rather than overwriting, so the history of what was actually recommended, and
+    when, is never lost."""
+    conn.execute(
+        "INSERT INTO recommendations (run_id, created_at, season, gameweek, payload) VALUES (?, ?, ?, ?, ?)",
+        (run_id, created_at, season, gameweek, json.dumps(payload)),
+    )
+    conn.commit()

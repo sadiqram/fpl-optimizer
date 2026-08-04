@@ -236,3 +236,42 @@ globally — `PointsModel` fits two independent regressors on different row subs
 column can be fine overall but degenerate within just one of those slices) before being
 handed to sklearn. The selected column set is stored at fit time and reused at predict
 time, so train/predict never see a mismatched schema.
+
+---
+
+## 13. `predictions`/`recommendations` had no `season` column
+
+**When:** M5, designing the schema change to persist every `recommend` call's output
+(FR6).
+**Found by:** Deliberately checking the existing `predictions`/`recommendations` DDL against
+the same question entries #2 and #3 already answered for `players`/`fixtures` — do gameweek
+numbers collide across seasons here too — before writing any code that would depend on the
+answer, rather than after it silently merged two seasons' rows.
+**What happened:** Both tables were keyed on `(model_version, player_id, gameweek, run_date)`
+/ `gameweek` alone. Nothing had ever written to them yet, but the very first real use —
+`fpl-optimizer recommend --season 2024-25 --gameweek 20`, exactly the example already in
+`README.md` — would have collided with a `--season 2025-26 --gameweek 20` run under the same
+key, identical to entries #2/#3's root cause.
+**Fix:** Added a required `season` column to both tables and folded it into `predictions`'
+`UNIQUE` constraint. Since both tables were empty (verified: `SELECT COUNT(*)` = 0 on the
+local DB), this was a plain schema edit, not a migration.
+
+---
+
+## 14. Every command but `ingest` assumed the schema already existed
+
+**When:** M5, first live run of `fpl-optimizer recommend` after entry #13's schema edit.
+**Found by:** Running it — `sqlite3.OperationalError: no such table: predictions` on the
+first attempt, immediately after the local `predictions`/`recommendations` tables had been
+dropped (to pick up the new `season` column, entry #13) and recreated by manually invoking
+`db.init_db()` once by hand.
+**What happened:** `db.init_db()` — which is fully idempotent, just `CREATE TABLE IF NOT
+EXISTS` statements — was only ever called from `_cmd_ingest`. Every other command
+(`recommend`, `train`, `backtest`, `features`, and the new `results`/`evaluate`) called
+`db.connect()` and assumed the schema was already current. A fresh clone that ran
+`recommend` before ever running `ingest`, or — the case that actually happened here — any
+existing DB that predates a schema change, would hit this same crash.
+**Fix:** Moved the `init_db()` call into `db.connect()` itself. Since it's idempotent and
+cheap at this data size (Architecture P4), every command now self-heals a stale or missing
+schema instead of only `ingest` doing so; `_cmd_ingest`'s now-redundant explicit call was
+removed.

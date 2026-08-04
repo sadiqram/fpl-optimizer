@@ -1,10 +1,7 @@
-"""Scoring functions shared by the backtest harness and (eventually) live tracking —
-Architecture §4.8 lists these metrics once, for both mechanisms; this is where the actual
-calculations live so neither reimplements them.
-
-Live tracking itself (join logged predictions to real outcomes after each real gameweek
-resolves, append to a running accuracy log) isn't built yet — that's PRD M5 (weekly live
-run). These are pure functions over already-fetched DataFrames; they don't touch the DB.
+"""Scoring functions shared by the backtest harness and live tracking (`cli._cmd_evaluate`,
+PRD M5) — Architecture §4.8 lists these metrics once, for both mechanisms; this is where the
+actual calculations live so neither reimplements them. These are pure functions over
+already-fetched DataFrames; they don't touch the DB.
 """
 
 from __future__ import annotations
@@ -25,6 +22,18 @@ def mae_rmse_by_position(predictions: pd.DataFrame, actuals: pd.DataFrame) -> pd
         "rmse": grouped.apply(lambda e: np.sqrt((e ** 2).mean())),
         "n": grouped.count(),
     }).reset_index()
+
+
+def overall_mae_rmse(predictions: pd.DataFrame, actuals: pd.DataFrame) -> dict:
+    """predictions: player_id, expected_points. actuals: player_id, total_points. A single
+    summary across all positions — {"mae", "rmse", "n"} — as opposed to
+    mae_rmse_by_position's per-position breakdown. This is what `evaluate` appends to the
+    running accuracy log (Architecture §4.8): one comparable number per (season, gameweek,
+    model), rather than a table, so a season's trend is a single column to eyeball.
+    """
+    merged = predictions.merge(actuals[["player_id", "total_points"]], on="player_id")
+    error = merged["expected_points"] - merged["total_points"]
+    return {"mae": float(error.abs().mean()), "rmse": float((error ** 2).mean() ** 0.5), "n": len(merged)}
 
 
 def minutes_calibration(predictions: pd.DataFrame, actuals: pd.DataFrame, n_bins: int = 5) -> pd.DataFrame:

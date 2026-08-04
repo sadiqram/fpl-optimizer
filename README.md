@@ -25,9 +25,13 @@ fpl-optimizer features --season 2024-25 --gameweek 20    # build + materialize f
 fpl-optimizer recommend --season 2024-25 --gameweek 20 --model poisson  # predict + optimize: squad, XI, captain
 ```
 
-`--model` is `naive` (recent scoring average) or `poisson` (default — goals/assists/clean-sheets
-modelled from xG/xA/team defense, scored by real FPL position rules). Both are permanent
-baselines to compare a real model against, not scaffolding (Architecture §4.4).
+`--model` is `naive` (recent scoring average), `poisson` (default — goals/assists/clean-sheets
+modelled from xG/xA/team defense, scored by real FPL position rules), or `gbm` (loads a model
+already trained and saved via `train --save`). `naive`/`poisson` are permanent baselines to
+compare a real model against, not scaffolding (Architecture §4.4).
+
+Every `recommend` run logs its predictions and full recommendation to the DB (FR6, Architecture
+P3) — that's what `evaluate` below reads.
 
 ```bash
 fpl-optimizer train --season 2024-25 --train-start 2 --train-end 27 --test-start 28 --test-end 38 --save
@@ -48,11 +52,17 @@ hindsight-optimal squad chosen with perfect knowledge of the results). `--model 
 automatically on every gameweek strictly before `--start-gameweek`, so the backtest window
 is never leaked into training.
 
-Planned, not yet implemented (see milestones in the PRD):
-
 ```bash
-fpl-optimizer evaluate --gameweek 11
+fpl-optimizer results --season 2026-27 --gameweek 3    # fetch + store actual per-player results for a live gameweek
+fpl-optimizer evaluate --season 2026-27 --gameweek 3   # compare logged predictions against those results
 ```
+
+`results` is the live-season counterpart to `bootstrap-season` — archive-bootstrapped
+seasons already have actual results and don't need it. `evaluate` reads only from the DB
+(predictions logged by `recommend`, actuals from `results`/the archive) and reports
+MAE/RMSE overall and by position, plus minutes calibration, per logged model — pass `--model`
+to filter to one. Each run appends a summary row to `data/artifacts/evaluation/accuracy_log.csv`
+(Architecture §4.8, "Live tracking").
 
 ## Tests
 

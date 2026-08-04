@@ -131,21 +131,27 @@ CREATE TABLE IF NOT EXISTS player_id_map (
     notes           TEXT
 );
 
+-- season is required alongside gameweek for the same reason as player_gw_stats/fixtures
+-- (Architecture §4.2, error_log.md #3): gameweek numbers reset every season, so
+-- `recommend --season 2024-25 --gameweek 20` and `--season 2025-26 --gameweek 20` must not
+-- collide.
 CREATE TABLE IF NOT EXISTS predictions (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     model_version    TEXT NOT NULL,
+    season           TEXT NOT NULL,
     player_id        INTEGER NOT NULL REFERENCES players(id),
     gameweek         INTEGER NOT NULL,
     run_date         TEXT NOT NULL,
     expected_points  REAL NOT NULL,
     p_start          REAL,
     std_dev          REAL,
-    UNIQUE (model_version, player_id, gameweek, run_date)
+    UNIQUE (model_version, season, player_id, gameweek, run_date)
 );
 
 CREATE TABLE IF NOT EXISTS recommendations (
     run_id     TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
+    season     TEXT NOT NULL,
     gameweek   INTEGER NOT NULL,
     payload    TEXT NOT NULL  -- full recommendation output + rationale, as JSON
 );
