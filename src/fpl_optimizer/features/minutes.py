@@ -44,7 +44,7 @@ def build(conn, as_of_date: str, season: str, gameweek: int, window: int = 5) ->
     else:
         out = out.reindex(columns=out.columns.tolist() + gw_cols)
 
-    snap_cols = ["status", "chance_of_playing_this_round", "chance_of_playing_next_round"]
+    snap_cols = ["status", "chance_of_playing_this_round", "chance_of_playing_next_round", "now_cost"]
     snapshot_rows = db.get_player_snapshots_as_of(conn, as_of_date)
     if snapshot_rows:
         snap_df = pd.DataFrame([dict(r) for r in snapshot_rows]).set_index("player_id")

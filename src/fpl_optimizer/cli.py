@@ -13,7 +13,11 @@ from fpl_optimizer.features import build as feature_build
 from fpl_optimizer.ingestion import archive_loader, understat
 from fpl_optimizer.ingestion.fpl_api import FPLClient
 from fpl_optimizer.ingestion.snapshots import save_raw
+from fpl_optimizer.models.baseline import NaivePredictor, PoissonPredictor
+from fpl_optimizer.optimize import constraints, lineup, squad
 from fpl_optimizer.storage import db
+
+PREDICTORS = {"naive": NaivePredictor, "poisson": PoissonPredictor}
 
 DEFAULT_DB_PATH = Path("data/db/fpl.sqlite")
 
@@ -94,6 +98,45 @@ def _cmd_features(args: argparse.Namespace) -> None:
     print(f"Built features for {args.season} GW{args.gameweek} as of {as_of_date}: {len(df)} players -> {path}")
 
 
+def _cmd_recommend(args: argparse.Namespace) -> None:
+    conn = db.connect(args.db_path)
+    as_of_date = args.as_of or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    features_df = feature_build.assemble_features(conn, as_of_date, args.season, args.gameweek)
+
+    predictor = PREDICTORS[args.model]()
+    predictor.fit(features_df)
+    predictions = predictor.predict(features_df)
+
+    merged = predictions.merge(
+        features_df[["player_id", "element_type", "team_id", "now_cost"]], on="player_id", how="left"
+    )
+    usable = merged.dropna(subset=["element_type", "team_id", "now_cost", "expected_points"])
+    dropped = len(merged) - len(usable)
+
+    squad_df = squad.build_squad(usable)
+    picked = lineup.build_lineup(squad_df)
+
+    names = {r["id"]: r["web_name"] for r in conn.execute("SELECT id, web_name FROM players").fetchall()}
+    conn.close()
+
+    def label(player_id: int) -> str:
+        pts = usable.loc[usable.player_id == player_id, "expected_points"].iloc[0]
+        tag = " (C)" if player_id == picked["captain"] else " (VC)" if player_id == picked["vice_captain"] else ""
+        return f"{names.get(player_id, f'#{player_id}')}{tag} — {pts:.1f} xPts"
+
+    print(f"Recommendation for {args.season} GW{args.gameweek} ({args.model} model, as of {as_of_date})")
+    if dropped:
+        print(f"  ({dropped} players excluded — missing price/position/prediction data)")
+    print(f"  Squad cost: {squad_df['now_cost'].sum() / 10:.1f}m / {constraints.BUDGET / 10:.1f}m")
+    print(f"  Squad expected points: {squad_df['expected_points'].sum():.1f}")
+    print("\n  Starting XI:")
+    for player_id in picked["starting_xi"]:
+        print(f"    {label(player_id)}")
+    print("  Bench:")
+    for player_id in picked["bench"]:
+        print(f"    {label(player_id)}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fpl-optimizer")
     parser.add_argument("--db-path", type=Path, default=DEFAULT_DB_PATH)
@@ -120,6 +163,13 @@ def build_parser() -> argparse.ArgumentParser:
     features_cmd.add_argument("--gameweek", type=int, required=True)
     features_cmd.add_argument("--as-of", default=None, help="ISO date; defaults to today.")
     features_cmd.set_defaults(func=_cmd_features)
+
+    recommend_cmd = subparsers.add_parser("recommend", help="Predict + optimize: squad, XI, captain for one gameweek.")
+    recommend_cmd.add_argument("--season", required=True, help="e.g. 2024-25")
+    recommend_cmd.add_argument("--gameweek", type=int, required=True)
+    recommend_cmd.add_argument("--as-of", default=None, help="ISO date; defaults to today.")
+    recommend_cmd.add_argument("--model", choices=sorted(PREDICTORS), default="poisson")
+    recommend_cmd.set_defaults(func=_cmd_recommend)
 
     return parser
 

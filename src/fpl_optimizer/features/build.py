@@ -25,9 +25,12 @@ FEATURE_TRUST = {
     # form.py, and fixtures.py's team-form half: derived from completed-match outcomes —
     # facts that don't change retroactively, trusted from any source.
     "points_mean": "outcome_derived",
+    "points_std": "outcome_derived",
     "points_decayed": "outcome_derived",
     "minutes_mean": "outcome_derived",
     "xgi_mean": "outcome_derived",
+    "xg_mean": "outcome_derived",
+    "xa_mean": "outcome_derived",
     "goals_for_avg": "outcome_derived",
     "goals_against_avg": "outcome_derived",
     "clean_sheet_rate": "outcome_derived",
@@ -39,6 +42,7 @@ FEATURE_TRUST = {
     "status": "state_at_deadline",
     "chance_of_playing_this_round": "state_at_deadline",
     "chance_of_playing_next_round": "state_at_deadline",
+    "now_cost": "state_at_deadline",
 }
 
 

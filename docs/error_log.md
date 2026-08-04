@@ -172,3 +172,42 @@ agreed on).
 sandbox's data, not a defect. Logged here so it isn't mistaken for a lingering bug in
 `resolve_gameweek()` later. Would not occur against the real production FPL API / archive /
 Understat.
+
+---
+
+## 10. Archive CSV nulls are the literal string `"None"`, not an empty string
+
+**When:** Building the baseline predictor/optimizer, re-running `bootstrap-season` after
+adding archive price-snapshot ingestion (needed so the optimizer has a budget to work
+with).
+**Found by:** Running it — crashed with `ValueError: invalid literal for int() with base
+10: 'None'` on the very first attempt.
+**What happened:** `_int_or()` and `db.insert_player_snapshots`'s `_pct()` both treated
+`(None, "")` as the full set of "no value" cases, since that's what the FPL API's JSON
+gives you for a null. But `players_raw.csv`'s `chance_of_playing_this_round` column (and
+others) store an absent value as the four-character string `"None"` — a CSV artifact of
+whatever wrote Python's `None` object as text rather than leaving the cell empty.
+**Fix:** Both helpers now check against `(None, "", "None", "NA", "nan")`. A reminder that
+"null" has more spellings in the wild than the two an API client happens to produce —
+worth treating any newly-integrated text source's nulls as an open question, not an
+assumption.
+
+---
+
+## 11. Optimizer's leakage guard correctly rejected my own too-early test date
+
+**When:** First live run of `fpl-optimizer recommend` end-to-end.
+**Found by:** `now_cost` was 0/804 non-null for every player — traced to `usable` having
+zero rows after `dropna`.
+**What happened:** Not a bug. The archive only ever gets one price snapshot per season
+(dated at that season's last known fixture — see the `bootstrap_season` docstring), and I'd
+asked for a recommendation as-of a date several months *before* that snapshot. The as-of
+guard (`get_player_snapshots_as_of`, entry #2's whole reason for existing) correctly
+returned nothing, because as of that date, in-universe, that price snapshot didn't exist
+yet.
+**Resolution:** Re-ran with `--as-of` set to the archive's actual snapshot date. Not a code
+change — a reminder of a real limitation already documented in PRD §6a.4 and Architecture
+§4.2 (archive-sourced state-at-deadline fields are single, approximate snapshots, not true
+per-gameweek history): the optimizer can only price a squad as of the one date the archive
+happens to give it a price for. Own-snapshot-sourced seasons (the live 2026-27 season,
+going forward) won't have this limitation once enough daily snapshots accumulate.

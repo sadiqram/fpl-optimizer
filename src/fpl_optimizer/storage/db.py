@@ -95,7 +95,8 @@ def insert_player_snapshots(
     source: str = "own_snapshot",
 ) -> None:
     def _pct(value):
-        return float(value) if value not in (None, "") else None
+        # Archive CSV rows can carry the literal string "None" for nulls, not just "".
+        return float(value) if value not in (None, "", "None", "NA", "nan") else None
 
     rows = [
         {

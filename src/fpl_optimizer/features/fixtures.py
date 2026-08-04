@@ -54,7 +54,7 @@ def build(conn, season: str, gameweek: int) -> pd.DataFrame:
 
     placeholders = ",".join(["?"] * len(active_players))
     player_rows = conn.execute(
-        f"SELECT id AS player_id, team_id FROM players WHERE id IN ({placeholders})",
+        f"SELECT id AS player_id, team_id, element_type FROM players WHERE id IN ({placeholders})",
         active_players,
     ).fetchall()
     out = out.join(pd.DataFrame([dict(r) for r in player_rows]).set_index("player_id"))

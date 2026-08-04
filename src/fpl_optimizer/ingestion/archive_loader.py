@@ -132,12 +132,15 @@ def _ensure_element_types(conn, element_type_ids: set[int]) -> None:
     db.upsert_element_types(conn, rows)
 
 
+_NULLISH = (None, "", "None", "NA", "nan")
+
+
 def _int_or(value, default=0):
-    return int(value) if value not in (None, "") else default
+    return int(value) if value not in _NULLISH else default
 
 
 def _float_or_none(value):
-    return float(value) if value not in (None, "") else None
+    return float(value) if value not in _NULLISH else None
 
 
 def bootstrap_season(conn, season: str) -> dict:
@@ -191,6 +194,29 @@ def bootstrap_season(conn, season: str) -> dict:
     if fixtures_rows:
         db.insert_fixtures(conn, fixtures_rows, season=season)
 
+    # players_raw.csv is a single scrape of that season's state — not truly point-in-time
+    # per gameweek, just the closest thing the archive has (PRD §6a.4: state-at-deadline
+    # fields from an archive are approximate, not trusted the way own snapshots are).
+    # Tagged with the latest known kickoff date as a rough "as of" marker.
+    snapshot_date = max((f["kickoff_time"] for f in fixtures_rows if f["kickoff_time"]), default=None)
+    snapshot_date = snapshot_date[:10] if snapshot_date else f"{season.split('-')[0]}-08-01"
+    snapshot_rows = [
+        {
+            "code": int(p["code"]),
+            "now_cost": _int_or(p.get("now_cost"), default=None),
+            "selected_by_percent": p.get("selected_by_percent"),
+            "status": p.get("status"),
+            "chance_of_playing_this_round": _int_or(p.get("chance_of_playing_this_round"), default=None),
+            "chance_of_playing_next_round": _int_or(p.get("chance_of_playing_next_round"), default=None),
+            "news": p.get("news"),
+        }
+        for p in data["players"]
+    ]
+    db.insert_player_snapshots(
+        conn, snapshot_rows, snapshot_date=snapshot_date,
+        fetched_at=f"archive_bootstrap:{season}", source="archive:vaastav",
+    )
+
     gameweeks = fetch_gameweeks(season)
     gw_stat_rows = 0
     for gw, rows in gameweeks.items():
@@ -229,6 +255,8 @@ def bootstrap_season(conn, season: str) -> dict:
         "teams": len(teams_rows),
         "players": len(players_rows),
         "fixtures": len(fixtures_rows),
+        "snapshot_rows": len(snapshot_rows),
+        "snapshot_date": snapshot_date,
         "gameweeks_fetched": len(gameweeks),
         "gw_stat_rows": gw_stat_rows,
         "understat_id_matches": id_map_matches,
