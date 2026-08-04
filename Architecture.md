@@ -68,6 +68,7 @@ fpl-optimizer/
 │   ├── ingestion/          # API clients, scrapers → raw snapshots
 │   │   ├── fpl_api.py
 │   │   ├── understat.py
+│   │   ├── archive_loader.py  # third-party historical archives — bootstrap only
 │   │   └── snapshots.py
 │   ├── storage/            # schema, migrations, repository functions
 │   │   ├── schema.sql
@@ -90,7 +91,8 @@ fpl-optimizer/
 │   ├── strategy/
 │   │   ├── horizon.py      # multi-GW rolling optimization
 │   │   ├── transfers.py    # hit thresholds, FT banking
-│   │   └── chips.py        # chip timing scenarios
+│   │   ├── chips.py        # chip timing scenarios
+│   │   └── risk.py         # risk parameter writers (manual in v1) + presets
 │   ├── evaluation/
 │   │   ├── backtest.py
 │   │   └── metrics.py
@@ -132,6 +134,10 @@ fpl-optimizer/
 
 **Rate limiting / politeness:** the FPL API is unauthenticated and free; scrapers (Understat/FBref) need throttling and caching. Cache aggressively — historical data never changes, so re-scraping it is pure waste and unnecessary load on someone else's server.
 
+**Bootstrapping pre-launch history.** The snapshot mechanism above only produces point-in-time-correct data *from the day it starts running*. Backtesting (PRD M4) needs seasons that predate the project, and the FPL API exposes only current state — so pre-launch history has to come from a third-party archive (primary candidate: `vaastav/Fantasy-Premier-League`; `olbauday/FPL-Core-Insights` as a cross-check). `ingestion/archive_loader.py` pulls these into `data/raw/archive/{source}/{season}/`, parallel to but distinct from the live snapshot path — it's a one-time/occasional bootstrap, not part of the daily cadence.
+
+Archive fidelity is not uniform across fields, and the schema needs to make that queryable rather than assumed — see the feature trust partition in §4.2.
+
 ---
 
 ### 4.2 Storage
@@ -156,7 +162,18 @@ fpl-optimizer/
 **The critical design point — `player_snapshots` is separate from `player_gw_stats`:**
 Outcomes (points scored) are immutable facts attached to a gameweek. Attributes (price, injury status, ownership) are *time-varying and revised*. Collapsing them into one table is how leakage sneaks in — you'd end up training on "player was flagged injured" data that was only known *after* the deadline you're pretending to predict from. Keeping snapshots separate and keyed by observation date makes as-of queries the natural default rather than a thing you have to remember to do.
 
-**ID mapping:** FPL and Understat use different player IDs, and name matching is genuinely messy (accents, initials, transfers mid-season). A dedicated `player_id_map` table with a manual override file is the pragmatic solution — accept that ~5% needs human correction rather than over-engineering a fuzzy matcher.
+**Provenance — `player_snapshots` and `player_gw_stats` carry a `source` column** (`own_snapshot`, `archive:vaastav`, `archive:olbauday`, …). This is what makes the feature trust partition below queryable rather than asserted, and it's what lets you later measure archive-vs-own-snapshot divergence on volatile fields once enough own history has accumulated.
+
+**Feature trust partition** (PRD §6a.4) — not every historical field is equally trustworthy pre-launch:
+
+| Class | Examples | Trusted when |
+|---|---|---|
+| Outcome-derived | minutes, goals, assists, clean sheets, xG/xA from completed matches | Any `source` — these are post-match facts that don't change retroactively |
+| State-at-deadline | injury flag, `chance_of_playing`, price, ownership %, `xP` | Only `source = own_snapshot`; archive-sourced rows are approximate |
+
+This isn't a DB constraint — it's a small registry in `features/build.py` mapping feature family → trust class, which the evaluation layer (§4.8) reads to label a backtest run's conclusions as trusted vs. provisional. `xP` is excluded as a feature entirely, per the archive's own documented guidance that its provenance is unreliable.
+
+**ID mapping:** FPL and Understat use different player IDs, and name matching is genuinely messy (accents, initials, transfers mid-season). Check the archive's own `understat/` directory and ID mapping first — if its coverage is good enough, it removes the need to hand-roll fuzzy matching. `player_id_map` is then an ingestion of that mapping plus a manual override file for the gaps — accept that some small fraction needs human correction rather than over-engineering a fuzzy matcher.
 
 ---
 
@@ -239,6 +256,12 @@ Each run solves for the whole horizon but only *commits* the current gameweek's 
 
 **Chips as scenario comparison, not as optimizer variables:** for each chip, run the horizon solver with and without it active at each candidate gameweek, and compare totals. Chips are one-shot, discrete, and rare — four decisions per season. Folding them into the MILP adds combinatorial complexity for something a handful of scenario runs answers directly, and scenario output is far easier for a human to sanity-check ("Bench Boost in GW29 is worth +9 vs GW25's +4").
 
+**Risk parameter: a single scalar, one writer in v1.** The horizon solver's objective takes one risk scalar alongside the decay-weighted predictions. `strategy/risk.py` owns it behind a small interface (`RiskWriter.get(gameweek) -> float`) with exactly one implementation in v1 — `ManualRiskWriter`, reading a per-gameweek config/CLI value. An `AutoInferRiskWriter` is deferred to post-backtest-harness (PRD §6a.2). Because the optimizer only ever consumes the resolved scalar and never knows which writer produced it, adding that second writer later touches `risk.py` alone — `horizon.py`, `squad.py`, and `lineup.py` don't change.
+
+**Presets are config, not code branches.** `Balanced` / `Safe` / `Aggressive` / `Value-conscious` (PRD §6a.3) are named entries in `config/default.yaml` that set the risk scalar plus a couple of secondary objective weights (variance penalty, ownership bonus, budget-flexibility bonus). They resolve to the same MILP objective with different coefficients — never a different objective or a different code path, which keeps presets fully decoupled from `optimize/constraints.py` (§4.5): a new preset is a config entry, not a solver change.
+
+**Team value is a tiebreaker term, not an objective.** The Value-conscious preset's budget-flexibility weight enters as a small additive term on the existing expected-points objective, active only when it's close enough to matter between near-equal transfers — there's no separate "maximize value" mode (PRD §6a.3 has the full rationale).
+
 ---
 
 ### 4.7 Interface
@@ -300,3 +323,4 @@ Stated plainly so they're not discovered as surprises:
 | ID mapping needs periodic manual correction | Fuzzy matching alone can't handle transfers and name variants; manual override file is the honest fix |
 | Price-change prediction not modelled in v1 | Affects team value slowly; large added complexity for small point impact |
 | Optimizes absolute points, not mini-league relative position | Different objective (variance-seeking when behind); deferred to v2 |
+| Pre-launch backtests rely on third-party archive data of unverified point-in-time fidelity | Feature trust partition (§4.2) labels which conclusions are trusted vs. provisional; resolves once ~1 season of own snapshots accumulates |
