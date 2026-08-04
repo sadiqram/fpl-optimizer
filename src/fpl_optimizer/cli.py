@@ -10,7 +10,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import joblib
+import pandas as pd
 
+from fpl_optimizer import clock
+from fpl_optimizer.evaluation import backtest
 from fpl_optimizer.features import build as feature_build
 from fpl_optimizer.ingestion import archive_loader, understat
 from fpl_optimizer.ingestion.fpl_api import FPLClient
@@ -18,8 +21,9 @@ from fpl_optimizer.ingestion.snapshots import save_raw
 from fpl_optimizer.models import training_data
 from fpl_optimizer.models.baseline import NaivePredictor, PoissonPredictor
 from fpl_optimizer.models.ensemble import EnsemblePredictor
-from fpl_optimizer.optimize import constraints, lineup, squad
+from fpl_optimizer.optimize import constraints
 from fpl_optimizer.storage import db
+from fpl_optimizer.strategy import horizon
 
 PREDICTORS = {"naive": NaivePredictor, "poisson": PoissonPredictor}
 
@@ -105,21 +109,15 @@ def _cmd_features(args: argparse.Namespace) -> None:
 
 def _cmd_recommend(args: argparse.Namespace) -> None:
     conn = db.connect(args.db_path)
-    as_of_date = args.as_of or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    features_df = feature_build.assemble_features(conn, as_of_date, args.season, args.gameweek)
+    the_clock = clock.FixedClock(args.as_of) if args.as_of else clock.SystemClock()
 
     predictor = PREDICTORS[args.model]()
-    predictor.fit(features_df)
-    predictions = predictor.predict(features_df)
+    predictor.fit(pd.DataFrame())  # baselines are stateless; fit() is a documented no-op
 
-    merged = predictions.merge(
-        features_df[["player_id", "element_type", "team_id", "now_cost"]], on="player_id", how="left"
-    )
-    usable = merged.dropna(subset=["element_type", "team_id", "now_cost", "expected_points"])
-    dropped = len(merged) - len(usable)
-
-    squad_df = squad.build_squad(usable)
-    picked = lineup.build_lineup(squad_df)
+    result = horizon.recommend_gameweek(conn, the_clock, args.season, args.gameweek, predictor)
+    usable = result["predictions"].dropna(subset=["element_type", "team_id", "now_cost", "expected_points"])
+    dropped = len(result["predictions"]) - len(usable)
+    squad_df, picked = result["squad"], result["lineup"]
 
     names = {r["id"]: r["web_name"] for r in conn.execute("SELECT id, web_name FROM players").fetchall()}
     conn.close()
@@ -129,7 +127,7 @@ def _cmd_recommend(args: argparse.Namespace) -> None:
         tag = " (C)" if player_id == picked["captain"] else " (VC)" if player_id == picked["vice_captain"] else ""
         return f"{names.get(player_id, f'#{player_id}')}{tag} — {pts:.1f} xPts"
 
-    print(f"Recommendation for {args.season} GW{args.gameweek} ({args.model} model, as of {as_of_date})")
+    print(f"Recommendation for {args.season} GW{args.gameweek} ({args.model} model, as of {result['as_of_date']})")
     if dropped:
         print(f"  ({dropped} players excluded — missing price/position/prediction data)")
     print(f"  Squad cost: {squad_df['now_cost'].sum() / 10:.1f}m / {constraints.BUDGET / 10:.1f}m")
@@ -180,6 +178,36 @@ def _cmd_train(args: argparse.Namespace) -> None:
         print(f"\nSaved trained ensemble -> {model_path}")
 
 
+def _cmd_backtest(args: argparse.Namespace) -> None:
+    conn = db.connect(args.db_path)
+
+    if args.model == "gbm":
+        # Train only on gameweeks strictly before the backtest window — training on data
+        # that overlaps it would leak the backtest's own future into itself.
+        print(f"Training GBM ensemble on {args.season} GW2-{args.start_gameweek - 1}...")
+        train_features, train_targets = training_data.build_training_set(conn, args.season, range(2, args.start_gameweek))
+        predictor = EnsemblePredictor()
+        predictor.fit(train_features, train_targets)
+    else:
+        predictor = PREDICTORS[args.model]()
+        predictor.fit(pd.DataFrame())  # stateless baseline; fit() is a documented no-op
+
+    print(f"Backtesting {args.season} GW{args.start_gameweek}-{args.end_gameweek} ({args.model})...")
+    results = backtest.backtest_season(conn, args.season, args.start_gameweek, args.end_gameweek, predictor)
+    conn.close()
+
+    if results.empty:
+        raise SystemExit("No gameweeks in that range had recorded outcomes to backtest against.")
+
+    print(f"\n{len(results)} gameweeks scored:")
+    print(f"  Mean MAE: {results['mae'].mean():.3f}   Mean RMSE: {results['rmse'].mean():.3f}")
+    print(f"  Recommended-squad points (total): {results['recommended_squad_points'].sum():.0f}")
+    print(f"  Hindsight-optimal points (total): {results['hindsight_squad_points'].sum():.0f}")
+    print(f"  Squad regret (total): {results['squad_regret'].sum():.0f}  (mean {results['squad_regret'].mean():.1f}/gameweek)")
+    print("\nPer gameweek:")
+    print(results.to_string(index=False))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fpl-optimizer")
     parser.add_argument("--db-path", type=Path, default=DEFAULT_DB_PATH)
@@ -224,6 +252,15 @@ def build_parser() -> argparse.ArgumentParser:
     train_cmd.add_argument("--test-end", type=int, required=True)
     train_cmd.add_argument("--save", action="store_true", help="Persist the trained ensemble to data/artifacts/models/.")
     train_cmd.set_defaults(func=_cmd_train)
+
+    backtest_cmd = subparsers.add_parser(
+        "backtest", help="Replay a season gameweek-by-gameweek through the live pipeline (Architecture §4.8, P2)."
+    )
+    backtest_cmd.add_argument("--season", required=True, help="e.g. 2024-25")
+    backtest_cmd.add_argument("--start-gameweek", type=int, required=True)
+    backtest_cmd.add_argument("--end-gameweek", type=int, required=True)
+    backtest_cmd.add_argument("--model", choices=[*sorted(PREDICTORS), "gbm"], default="poisson")
+    backtest_cmd.set_defaults(func=_cmd_backtest)
 
     return parser
 

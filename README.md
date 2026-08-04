@@ -37,10 +37,20 @@ Trains the GBM ensemble (P(minutes) x E[points|plays], per Architecture §4.4) o
 gameweek range and reports MAE against both baselines on a held-out range. `--save`
 persists the trained model to `data/artifacts/models/`.
 
+```bash
+fpl-optimizer backtest --season 2024-25 --start-gameweek 30 --end-gameweek 38 --model gbm
+```
+
+Replays a season gameweek-by-gameweek through the exact same pipeline `recommend` uses
+(Architecture §4.8, P2 — the only thing that differs is the injected clock), scoring each
+gameweek's MAE/RMSE and squad-selection regret (recommended squad's actual points vs. a
+hindsight-optimal squad chosen with perfect knowledge of the results). `--model gbm` trains
+automatically on every gameweek strictly before `--start-gameweek`, so the backtest window
+is never leaked into training.
+
 Planned, not yet implemented (see milestones in the PRD):
 
 ```bash
-fpl-optimizer backtest --season 2023-24
 fpl-optimizer evaluate --gameweek 11
 ```
 

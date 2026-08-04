@@ -14,7 +14,7 @@ from fpl_optimizer.features import build as feature_build
 from fpl_optimizer.storage import db
 
 
-def _season_as_of_date(conn, season: str) -> str:
+def season_as_of_date(conn, season: str) -> str:
     """Archive seasons carry exactly one price/status snapshot, dated at that season's
     latest known fixture (archive_loader.bootstrap_season) — every historical training row
     resolves to that same snapshot regardless of which gameweek it's for. This mirrors that
@@ -29,7 +29,7 @@ def build_training_set(conn, season: str, gameweeks: range) -> tuple[pd.DataFram
     as the label. Rows with no recorded outcome that gameweek (didn't play, or the gameweek
     hasn't happened) are dropped — there's nothing to train on without a real label.
     """
-    as_of_date = _season_as_of_date(conn, season)
+    as_of_date = season_as_of_date(conn, season)
     target_cols = ["minutes", "total_points"]
 
     combined_frames = []

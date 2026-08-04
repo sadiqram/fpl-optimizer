@@ -270,6 +270,8 @@ Each run solves for the whole horizon but only *commits* the current gameweek's 
 
 **Team value is a tiebreaker term, not an objective.** The Value-conscious preset's budget-flexibility weight enters as a small additive term on the existing expected-points objective, active only when it's close enough to matter between near-equal transfers — there's no separate "maximize value" mode (PRD §6a.3 has the full rationale).
 
+**Current state: `horizon.py` implements the single-gameweek foundation, not yet the rolling horizon.** `recommend_gameweek(conn, clock, season, gameweek, predictor)` runs features → predict → optimize for one gameweek and is the shared pipeline both `fpl-optimizer recommend` and the backtest harness call (Architecture P2 — see §4.8's injected-clock justification). The decay-weighted multi-GW lookahead described above extends this function; it doesn't replace it, and the single-GW version stays the right tool for backtesting independent per-gameweek recommendations even after the rolling horizon exists.
+
 ---
 
 ### 4.7 Interface
@@ -296,9 +298,11 @@ fpl-optimizer evaluate --gameweek 11
 
 **Live tracking** (`evaluation/metrics.py`): after each real gameweek resolves, join logged predictions to actual outcomes and append to a running accuracy log.
 
-**Justification for the injected clock (`clock.py`):** this is the mechanism behind P2. The backtester differs from the live run in exactly one respect — what "now" returns. Every as-of query, every feature build, every model input flows from that. A separate backtest script that reimplements the pipeline would inevitably drift from live behaviour and quietly reintroduce leakage. One code path, one clock.
+**Justification for the injected clock (`clock.py`):** this is the mechanism behind P2. The backtester differs from the live run in exactly one respect — what "now" returns. Every as-of query, every feature build, every model input flows from that. A separate backtest script that reimplements the pipeline would inevitably drift from live behaviour and quietly reintroduce leakage. One code path, one clock. `clock.py` is deliberately DB-free (`SystemClock`/`FixedClock` are plain value types) — resolving *which* date an archived season's `FixedClock` should report is a backtest/training concern (`models/training_data.season_as_of_date`), not the clock's own job.
 
-**Metrics tracked:** MAE/RMSE by position, minutes-model calibration, points-model calibration, recommendation-level regret (points from recommended transfer vs. best possible in hindsight vs. holding), and season-level rank.
+**Metrics tracked:** MAE/RMSE by position, minutes-model calibration, points-model calibration, and squad-selection regret (`evaluation/metrics.squad_selection_regret`: actual points scored by the recommended squad vs. the best possible squad chosen with perfect hindsight, under identical budget/formation/team-limit constraints).
+
+**Regret is currently scoped to squad selection, not transfers, and there's no season-level rank yet.** The original framing — "points from recommended *transfer* vs. best possible vs. holding" — needs an owned squad's continuity and purchase price across gameweeks to mean anything, and season-level rank needs a full season played start to finish with real transfer decisions. Neither exists until the Strategy layer's rolling-horizon/transfer logic is built (PRD M6) — `backtest_season` replays *independent* per-gameweek recommendations ("what would the optimizer pick fresh, each week"), which is enough to validate the prediction→optimization pipeline itself without pretending to simulate a season that was never actually played that way. Squad-selection regret is the honest subset of the original metric buildable today.
 
 **Recommendation-level regret matters more than raw MAE.** The system's job isn't to forecast every player accurately — it's to pick the right transfer. A model can have mediocre MAE across all 600 players while consistently ranking the top options correctly, and that's the model you want.
 
