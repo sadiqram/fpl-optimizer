@@ -107,6 +107,10 @@ fpl-optimizer/
 │   └── artifacts/          # predictions, recommendations, logs
 ├── notebooks/              # exploration only, never imported by src/
 ├── tests/
+├── scripts/
+│   └── daily_ingest.sh     # cron entry calling `fpl-optimizer ingest` (§5: no orchestration framework)
+├── docs/
+│   └── error_log.md        # real bugs found + fixes, chronological — not a design doc
 ├── .env.example            # FPL_TEAM_ID etc. — real .env gitignored
 └── ARCHITECTURE.md
 ```
@@ -150,17 +154,21 @@ Archive fidelity is not uniform across fields, and the schema needs to make that
 
 | Table | Grain | Notes |
 |---|---|---|
-| `players` | player_id | Slowly-changing: name, position, team |
-| `player_gw_stats` | player_id × gameweek | Actual outcomes: points, minutes, goals, assists, bonus |
-| `player_snapshots` | player_id × snapshot_date | **Point-in-time**: price, ownership, injury flag, chance_of_playing |
-| `fixtures` | fixture_id | Teams, kickoff time, gameweek, home/away, FDR |
-| `team_stats` | team_id × gameweek | Aggregate attacking/defensive strength |
-| `understat_player_gw` | player_id × gameweek | xG, xA, shots, key passes |
-| `predictions` | model_version × player_id × gameweek × run_date | Every prediction ever made |
+| `players` | player code | Slowly-changing: name, position, team |
+| `player_gw_stats` | player code × season × gameweek | Actual outcomes: points, minutes, goals, assists, bonus |
+| `player_snapshots` | player code × snapshot_date × source | **Point-in-time**: price, ownership, injury flag, chance_of_playing |
+| `fixtures` | season × fixture_id | Teams, kickoff time, gameweek, home/away, FDR |
+| `team_stats` | team_id × season × gameweek | Aggregate attacking/defensive strength |
+| `understat_player_gw` | player code × season × gameweek | xG, xA, shots, key passes |
+| `predictions` | model_version × player code × gameweek × run_date | Every prediction ever made |
 | `recommendations` | run_id | Full recommendation output + rationale, as JSON |
 
 **The critical design point — `player_snapshots` is separate from `player_gw_stats`:**
 Outcomes (points scored) are immutable facts attached to a gameweek. Attributes (price, injury status, ownership) are *time-varying and revised*. Collapsing them into one table is how leakage sneaks in — you'd end up training on "player was flagged injured" data that was only known *after* the deadline you're pretending to predict from. Keeping snapshots separate and keyed by observation date makes as-of queries the natural default rather than a thing you have to remember to do.
+
+**Two identity gotchas discovered building this, not anticipated when this doc was first written** (full account in `docs/error_log.md`):
+1. **`players`' primary key is FPL's `code` (stable across seasons), not the `id`/`element` field the live API and per-season data use.** That field is reassigned every season — verified empirically (Salah was element id 191/233/308/328 in four different seasons on the same code). A schema keyed on it would silently merge unrelated players' historical stats once more than one season's data is loaded. The current-season element id is kept separately as `element_id`, used only for API calls that require it, and archive writes are structurally prevented from overwriting it with a stale value.
+2. **Gameweek numbers and fixture ids both reset every season.** `player_gw_stats`/`fixtures`/`team_stats`/`understat_player_gw` all carry a required `season` column as part of their key — without it, two different seasons' GW1 collide.
 
 **Provenance — `player_snapshots` and `player_gw_stats` carry a `source` column** (`own_snapshot`, `archive:vaastav`, `archive:olbauday`, …). This is what makes the feature trust partition below queryable rather than asserted, and it's what lets you later measure archive-vs-own-snapshot divergence on volatile fields once enough own history has accumulated.
 
@@ -173,7 +181,7 @@ Outcomes (points scored) are immutable facts attached to a gameweek. Attributes 
 
 This isn't a DB constraint — it's a small registry in `features/build.py` mapping feature family → trust class, which the evaluation layer (§4.8) reads to label a backtest run's conclusions as trusted vs. provisional. `xP` is excluded as a feature entirely, per the archive's own documented guidance that its provenance is unreliable.
 
-**ID mapping:** FPL and Understat use different player IDs, and name matching is genuinely messy (accents, initials, transfers mid-season). Check the archive's own `understat/` directory and ID mapping first — if its coverage is good enough, it removes the need to hand-roll fuzzy matching. `player_id_map` is then an ingestion of that mapping plus a manual override file for the gaps — accept that some small fraction needs human correction rather than over-engineering a fuzzy matcher.
+**ID mapping:** FPL and Understat use different player IDs, and name matching is genuinely messy (accents, initials, transfers mid-season). The archive's `DATA_DICTIONARY.md` documents a shipped `id_dict.csv` mapping — it doesn't actually exist in the repo (verified 404 across six seasons; it turned out to be an uncommitted local output of the archive's own matching script, not a shipped file). What *is* shipped is the two inputs that script uses (`players_raw.csv`, `understat_player.csv`) and its matching logic, which is simple exact-string matching on `"first_name second_name"` — replicated in `archive_loader.match_understat_ids()`. `player_id_map` is that output plus a manual override file for the unmatched remainder — accept that some small fraction needs human correction rather than over-engineering a fuzzier matcher.
 
 ---
 

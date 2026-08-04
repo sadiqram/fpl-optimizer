@@ -2,7 +2,7 @@
 
 A human-in-the-loop decision-support system for Fantasy Premier League: predicts player points, solves for the optimal squad/transfers/captain via MILP, and outputs a weekly recommendation for a human to review and act on. No auto-execution — FPL has no write API, and the design keeps a human in the loop by choice as well as by constraint.
 
-See [`fpl_ai_prd.md`](fpl_ai_prd.md) for the *what/why* and [`Architecture.md`](Architecture.md) for the *how*.
+See [`fpl_ai_prd.md`](fpl_ai_prd.md) for the *what/why*, [`Architecture.md`](Architecture.md) for the *how*, and [`docs/error_log.md`](docs/error_log.md) for real bugs found along the way and how they were fixed.
 
 ## Setup
 
@@ -18,7 +18,10 @@ Dependency versions are pinned in `requirements.lock.txt` (regenerate with `pip 
 ## Usage
 
 ```bash
-fpl-optimizer ingest   # M1: fetch current FPL state, write raw snapshots + parse into data/db/fpl.sqlite
+fpl-optimizer ingest                                    # fetch current FPL state, write raw snapshots + parse into data/db/fpl.sqlite
+fpl-optimizer bootstrap-season --season 2024-25          # load a past season from the vaastav archive
+fpl-optimizer understat --season 2024-25 --max-players 5 # fetch live Understat data, match to FPL players
+fpl-optimizer features --season 2024-25 --gameweek 20    # build + materialize features for one (season, gameweek)
 ```
 
 Planned, not yet implemented (see milestones in the PRD):
