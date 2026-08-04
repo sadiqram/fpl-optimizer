@@ -252,6 +252,60 @@ def upsert_player_id_map(conn: sqlite3.Connection, rows: list[dict]) -> None:
     conn.commit()
 
 
+def get_player_gw_stats_before(conn: sqlite3.Connection, season: str, gameweek: int) -> list[sqlite3.Row]:
+    """Outcome rows for `season` strictly before `gameweek`. This is the leakage boundary
+    for the features layer (Architecture §4.3): features built to decide `gameweek` may
+    only see gameweeks that had already finished. season and gameweek are both required —
+    gameweek numbers reset every season, so 'before gameweek N' is meaningless without one."""
+    cursor = conn.execute(
+        "SELECT * FROM player_gw_stats WHERE season = ? AND gameweek < ? ORDER BY gameweek",
+        (season, gameweek),
+    )
+    return cursor.fetchall()
+
+
+def get_understat_player_gw_before(conn: sqlite3.Connection, season: str, gameweek: int) -> list[sqlite3.Row]:
+    cursor = conn.execute(
+        "SELECT * FROM understat_player_gw WHERE season = ? AND gameweek < ? ORDER BY gameweek",
+        (season, gameweek),
+    )
+    return cursor.fetchall()
+
+
+def get_fixtures_for_gameweek(conn: sqlite3.Connection, season: str, gameweek: int) -> list[sqlite3.Row]:
+    """Fixtures ARE known in advance (the schedule is published well before deadlines) —
+    unlike outcomes, this is not a leakage risk."""
+    cursor = conn.execute(
+        "SELECT * FROM fixtures WHERE season = ? AND event = ?",
+        (season, gameweek),
+    )
+    return cursor.fetchall()
+
+
+def get_fixtures_before(conn: sqlite3.Connection, season: str, gameweek: int) -> list[sqlite3.Row]:
+    cursor = conn.execute(
+        "SELECT * FROM fixtures WHERE season = ? AND event < ? AND event IS NOT NULL ORDER BY event",
+        (season, gameweek),
+    )
+    return cursor.fetchall()
+
+
+def get_active_players(conn: sqlite3.Connection, season: str) -> list[int]:
+    """Player codes considered 'in scope' for `season`: whoever has an outcome row that
+    season, or — for a season with no gameweeks played yet (e.g. preseason) — whoever has
+    a live snapshot. Falls back rather than returning empty so early-season feature builds
+    degrade gracefully (NFR2) instead of silently producing nothing."""
+    rows = conn.execute(
+        "SELECT DISTINCT player_id FROM player_gw_stats WHERE season = ?", (season,)
+    ).fetchall()
+    if rows:
+        return [r["player_id"] for r in rows]
+    rows = conn.execute(
+        "SELECT DISTINCT player_id FROM player_snapshots WHERE source = 'own_snapshot'"
+    ).fetchall()
+    return [r["player_id"] for r in rows]
+
+
 def get_player_snapshots_as_of(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3.Row]:
     """Latest snapshot per player at or before as_of_date.
 

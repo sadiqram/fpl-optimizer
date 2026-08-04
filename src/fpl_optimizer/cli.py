@@ -9,6 +9,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from fpl_optimizer.features import build as feature_build
 from fpl_optimizer.ingestion import archive_loader, understat
 from fpl_optimizer.ingestion.fpl_api import FPLClient
 from fpl_optimizer.ingestion.snapshots import save_raw
@@ -84,6 +85,15 @@ def _cmd_understat(args: argparse.Namespace) -> None:
         print(f"  {key}: {value}")
 
 
+def _cmd_features(args: argparse.Namespace) -> None:
+    conn = db.connect(args.db_path)
+    as_of_date = args.as_of or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    df = feature_build.assemble_features(conn, as_of_date, args.season, args.gameweek)
+    path = feature_build.materialize_features(df, as_of_date)
+    conn.close()
+    print(f"Built features for {args.season} GW{args.gameweek} as of {as_of_date}: {len(df)} players -> {path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fpl-optimizer")
     parser.add_argument("--db-path", type=Path, default=DEFAULT_DB_PATH)
@@ -104,6 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
     understat_cmd.add_argument("--season", required=True, help="e.g. 2026-27")
     understat_cmd.add_argument("--max-players", type=int, default=None, help="Cap per-player match-log fetches.")
     understat_cmd.set_defaults(func=_cmd_understat)
+
+    features_cmd = subparsers.add_parser("features", help="Build and materialize features for one (season, gameweek).")
+    features_cmd.add_argument("--season", required=True, help="e.g. 2024-25")
+    features_cmd.add_argument("--gameweek", type=int, required=True)
+    features_cmd.add_argument("--as-of", default=None, help="ISO date; defaults to today.")
+    features_cmd.set_defaults(func=_cmd_features)
 
     return parser
 
