@@ -10,7 +10,7 @@ from fpl_optimizer.features import build as feature_build
 from fpl_optimizer.models.baseline import NaivePredictor
 from fpl_optimizer.optimize import squad
 from fpl_optimizer.storage import db
-from fpl_optimizer.strategy import horizon, squad_state, transfers
+from fpl_optimizer.strategy import horizon, risk, squad_state, transfers
 
 
 def test_compute_free_transfers_accrues_one_per_unused_gameweek():
@@ -323,3 +323,55 @@ def test_plan_horizon_weekly_predictions_span_the_full_decay_window(season_conn)
     week1 = result["weekly_predictions"][0]["predictions"].set_index("player_id")["expected_points"]
     direct = usable.set_index("player_id")["expected_points"]
     pd.testing.assert_series_equal(week1.sort_index(), direct.sort_index(), check_names=False)
+
+
+def test_apply_risk_adjustment_balanced_preset_is_a_no_op():
+    pool = pd.DataFrame({
+        "player_id": [1, 2], "expected_points": [5.0, 3.0], "std_dev": [2.0, 1.0],
+        "selected_by_percent": [50.0, 5.0], "now_cost": [80, 45],
+    })
+    adjusted = risk.apply_risk_adjustment(pool, risk.BALANCED_PRESET)
+    pd.testing.assert_series_equal(adjusted["expected_points"], pool["expected_points"])
+
+
+def test_apply_risk_adjustment_risk_rewards_or_penalizes_variance():
+    pool = pd.DataFrame({
+        "player_id": [1], "expected_points": [5.0], "std_dev": [2.0],
+        "selected_by_percent": [50.0], "now_cost": [80],
+    })
+    aggressive = risk.apply_risk_adjustment(pool, {"risk": 0.5, "variance_penalty": 0, "ownership_bonus": 0, "value_bonus": 0})
+    safe = risk.apply_risk_adjustment(pool, {"risk": -0.5, "variance_penalty": 0, "ownership_bonus": 0, "value_bonus": 0})
+    assert aggressive["expected_points"].iloc[0] == pytest.approx(5.0 + 0.5 * 2.0)
+    assert safe["expected_points"].iloc[0] == pytest.approx(5.0 - 0.5 * 2.0)
+
+
+def test_apply_risk_adjustment_ownership_bonus_favors_low_ownership():
+    pool = pd.DataFrame({
+        "player_id": [1, 2], "expected_points": [5.0, 5.0], "std_dev": [1.0, 1.0],
+        "selected_by_percent": [90.0, 5.0], "now_cost": [80, 80],
+    })
+    adjusted = risk.apply_risk_adjustment(pool, {"risk": 0, "variance_penalty": 0, "ownership_bonus": 1.0, "value_bonus": 0})
+    high_owned, low_owned = adjusted.set_index("player_id")["expected_points"]
+    assert low_owned > high_owned  # the 5%-owned player gets more of the bonus than the 90%-owned one
+
+
+def test_apply_risk_adjustment_degrades_gracefully_without_ownership_data():
+    """NFR2: a pool missing selected_by_percent entirely shouldn't crash or NaN out
+    expected_points — the ownership term just contributes nothing."""
+    pool = pd.DataFrame({"player_id": [1], "expected_points": [5.0], "std_dev": [1.0]})
+    adjusted = risk.apply_risk_adjustment(pool, {"risk": 0, "variance_penalty": 0, "ownership_bonus": 1.0, "value_bonus": 0})
+    assert adjusted["expected_points"].iloc[0] == pytest.approx(5.0)
+
+
+def test_resolve_preset_matches_config_and_rejects_unknown_names():
+    balanced = risk.resolve_preset("balanced")
+    assert balanced == risk.BALANCED_PRESET
+    assert risk.default_preset_name() == "balanced"
+    with pytest.raises(ValueError):
+        risk.resolve_preset("not_a_real_preset")
+
+
+def test_manual_risk_writer_returns_the_same_value_for_any_gameweek():
+    writer = risk.ManualRiskWriter(0.5)
+    assert writer.get(1) == 0.5
+    assert writer.get(38) == 0.5

@@ -24,7 +24,7 @@ from fpl_optimizer.models.baseline import NaivePredictor, PoissonPredictor
 from fpl_optimizer.models.ensemble import EnsemblePredictor
 from fpl_optimizer.optimize import constraints
 from fpl_optimizer.storage import db
-from fpl_optimizer.strategy import horizon, squad_state
+from fpl_optimizer.strategy import horizon, risk, squad_state
 
 PREDICTORS = {"naive": NaivePredictor, "poisson": PoissonPredictor}
 MODEL_CHOICES = [*sorted(PREDICTORS), "gbm"]
@@ -289,10 +289,15 @@ def _cmd_plan(args: argparse.Namespace) -> None:
         for r in owned_rows
     ])
 
+    preset = risk.resolve_preset(args.preset or risk.default_preset_name())
+    if args.risk is not None:
+        preset = {**preset, "risk": args.risk}
+
     predictor = _load_predictor(args)
     result = horizon.plan_horizon(
         conn, the_clock, args.season, args.gameweek, predictor, owned_squad,
         bank=team_state_row["bank"] or 0, free_transfers=team_state_row["free_transfers"],
+        preset=preset,
     )
     transfer_result, picked = result["transfer_result"], result["lineup"]
     week1 = result["weekly_predictions"][0]["predictions"]
@@ -306,7 +311,8 @@ def _cmd_plan(args: argparse.Namespace) -> None:
         tag = " (C)" if player_id == picked["captain"] else " (VC)" if player_id == picked["vice_captain"] else ""
         return f"{names.get(player_id, f'#{player_id}')}{tag} — {pts_str}"
 
-    print(f"Plan for {args.season} GW{args.gameweek} ({args.model} model, as of {result['as_of_date']})")
+    preset_name = args.preset or risk.default_preset_name()
+    print(f"Plan for {args.season} GW{args.gameweek} ({args.model} model, {preset_name} preset, as of {result['as_of_date']})")
     if transfer_result["transfers_in"]:
         print("\n  Transfers:")
         for out_id, in_id in zip(transfer_result["transfers_out"], transfer_result["transfers_in"]):
@@ -520,6 +526,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan_cmd.add_argument("--gameweek", type=int, required=True)
     plan_cmd.add_argument("--as-of", default=None, help="ISO date; defaults to today.")
     plan_cmd.add_argument("--model", choices=MODEL_CHOICES, default="poisson")
+    plan_cmd.add_argument(
+        "--preset", choices=sorted(risk.load_presets()), default=None,
+        help=f"Risk/secondary-weighting preset (PRD §6a.3). Defaults to config's risk.default_preset ({risk.default_preset_name()!r})."
+    )
+    plan_cmd.add_argument("--risk", type=float, default=None, help="Override the resolved preset's risk scalar directly.")
     plan_cmd.set_defaults(func=_cmd_plan)
 
     train_cmd = subparsers.add_parser(

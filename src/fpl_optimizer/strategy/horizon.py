@@ -21,7 +21,8 @@ from fpl_optimizer.clock import Clock
 from fpl_optimizer.features import build as feature_build
 from fpl_optimizer.models.base import Predictor
 from fpl_optimizer.optimize import lineup, squad
-from fpl_optimizer.strategy import transfers
+from fpl_optimizer.storage import db
+from fpl_optimizer.strategy import risk, transfers
 
 # PRD §6a.1's starting point — declining confidence in more distant gameweeks. horizon_gws
 # is derived from len(decay) rather than passed alongside it, so the two can't drift out of
@@ -83,6 +84,7 @@ def plan_horizon(
     bank: int,
     free_transfers: int,
     decay: list[float] = DEFAULT_DECAY,
+    preset: dict = risk.BALANCED_PRESET,
 ) -> dict:
     """Plans over `len(decay)` gameweeks starting at `gameweek`, but commits only this
     week's transfer + lineup decision (PRD §6a.1) — re-planning next week with fresh data
@@ -96,6 +98,12 @@ def plan_horizon(
     captaincy is "who scores most this week", not a horizon blend.
 
     `owned_squad`: player_id, selling_price — see `strategy.transfers.optimize_transfers`.
+    `preset`: {risk, variance_penalty, ownership_bonus, value_bonus} — see
+    `strategy.risk.apply_risk_adjustment`; only the transfer *decision* sees the
+    risk-adjusted score (matching Architecture's design that risk only ever adjusts the
+    optimizer's objective, never the underlying prediction). `weekly_predictions` and the
+    lineup/captain choice below always reflect true, unadjusted expected points — risk
+    appetite shapes which squad you end up with, not how a player's own week is reported.
 
     Returns {"as_of_date", "gameweek", "weekly_predictions" (list of {"gameweek",
     "predictions"} per window week, usable rows only, for logging/rationale),
@@ -117,7 +125,16 @@ def plan_horizon(
     horizon_points = pd.concat(weighted_frames).groupby("player_id", as_index=False)["expected_points"].sum()
 
     week1 = weekly_predictions[0]["predictions"]
-    pool = week1[["player_id", "element_type", "team_id", "now_cost"]].merge(horizon_points, on="player_id", how="inner")
+    # std_dev: week 1's own (not horizon-aggregated — the same "near-term is the most
+    # confident signal" reasoning as captaincy below; combining variances across weeks
+    # properly needs sqrt(sum(std_i^2 * weight_i^2)), not something worth inventing for a
+    # first cut PRD §11 already frames as tunable later).
+    pool = week1[["player_id", "element_type", "team_id", "now_cost", "std_dev"]].merge(
+        horizon_points, on="player_id", how="inner"
+    )
+    ownership = {r["player_id"]: r["selected_by_percent"] for r in db.get_player_snapshots_as_of(conn, as_of_date)}
+    pool["selected_by_percent"] = pool["player_id"].map(ownership)
+    pool = risk.apply_risk_adjustment(pool, preset)
 
     transfer_result = transfers.optimize_transfers(pool, owned_squad, bank, free_transfers)
 
