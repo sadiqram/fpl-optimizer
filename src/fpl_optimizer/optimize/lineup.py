@@ -42,6 +42,9 @@ def build_lineup(squad: pd.DataFrame) -> dict:
     return {
         "starting_xi": starting_xi["player_id"].tolist(),
         "bench": bench["player_id"].tolist(),
-        "captain": starting_xi.iloc[0]["player_id"],
-        "vice_captain": starting_xi.iloc[1]["player_id"],
+        # int(): .iloc[0][...] returns a numpy scalar, unlike .tolist() above which already
+        # converts to plain Python ints — left as numpy int64 this silently isn't
+        # JSON-serializable downstream (cli.py's recommendation payload).
+        "captain": int(starting_xi.iloc[0]["player_id"]),
+        "vice_captain": int(starting_xi.iloc[1]["player_id"]),
     }

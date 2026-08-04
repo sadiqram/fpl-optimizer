@@ -3,6 +3,8 @@ asserting invalid squads are rejected. Bugs here produce recommendations that ar
 illegal, not just suboptimal.
 """
 
+import json
+
 import pandas as pd
 import pytest
 
@@ -98,3 +100,16 @@ def test_lineup_picks_highest_scorer_as_captain():
     # The best overall scorer in the squad is always formation-eligible to start (removing
     # them never fixes an infeasible formation), so they must be the captain.
     assert picked["captain"] == best_in_squad
+
+
+def test_lineup_captain_and_vice_captain_are_plain_ints():
+    """Regression: captain/vice_captain came from `.iloc[0][...]`, a numpy scalar, unlike
+    starting_xi/bench which are built via `.tolist()` and are already plain Python ints.
+    A numpy.int64 silently isn't JSON-serializable — this crashed `cli.py`'s recommendation
+    payload the first time `recommend` was actually run end-to-end and logged."""
+    pool = _synthetic_pool()
+    squad_df = squad.build_squad(pool)
+    picked = lineup.build_lineup(squad_df)
+    assert type(picked["captain"]) is int
+    assert type(picked["vice_captain"]) is int
+    json.dumps({"captain": picked["captain"], "vice_captain": picked["vice_captain"]})

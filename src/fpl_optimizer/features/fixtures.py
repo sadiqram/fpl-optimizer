@@ -19,7 +19,16 @@ def _team_rolling_stats(conn, season: str, gameweek: int, window: int = TEAM_FOR
     played fixtures strictly before `gameweek` (db.get_fixtures_before enforces that)."""
     past = [dict(f) for f in db.get_fixtures_before(conn, season, gameweek) if f["finished"]]
     if not past:
-        return pd.DataFrame(columns=["team_id", "goals_for_avg", "goals_against_avg", "clean_sheet_rate"])
+        # dtype=... explicit, not just columns=[...] (which defaults to object dtype): an
+        # object-dtype all-NaN column survives .fillna() as object, and numpy ufuncs like
+        # np.exp() raise on an object array rather than broadcasting (PoissonPredictor hits
+        # this on goals_against_avg for a season with no fixture history yet, e.g. GW1).
+        return pd.DataFrame({
+            "team_id": pd.Series(dtype="int64"),
+            "goals_for_avg": pd.Series(dtype="float64"),
+            "goals_against_avg": pd.Series(dtype="float64"),
+            "clean_sheet_rate": pd.Series(dtype="float64"),
+        })
 
     rows = []
     for f in past:

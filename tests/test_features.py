@@ -109,6 +109,24 @@ def test_assemble_features_stable_schema_regardless_of_history(conn):
     empty_conn.close()
 
 
+def test_fixtures_team_form_all_nan_columns_are_float_dtype_not_object(conn):
+    """Regression: a season with no finished fixtures yet (e.g. GW1, pre-season) used to
+    return goals_for_avg/goals_against_avg/clean_sheet_rate as object-dtype all-None
+    columns rather than float64 all-NaN — `.fillna(...)` doesn't fix the dtype, and
+    np.exp() (PoissonPredictor's clean-sheet-probability calc) raises outright on an
+    object-dtype array rather than broadcasting."""
+    empty_conn = sqlite3.connect(":memory:")
+    empty_conn.row_factory = sqlite3.Row
+    db.init_db(empty_conn)
+    db.upsert_teams(empty_conn, [{"id": 1, "name": "Arsenal", "short_name": "ARS"}])
+
+    team_form = fixtures._team_rolling_stats(empty_conn, SEASON, gameweek=1)
+    assert team_form.empty
+    for col in ["goals_for_avg", "goals_against_avg", "clean_sheet_rate"]:
+        assert team_form[col].dtype == "float64"
+    empty_conn.close()
+
+
 def pd_isna(value) -> bool:
     import pandas as pd
     return pd.isna(value)

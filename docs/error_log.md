@@ -275,3 +275,46 @@ existing DB that predates a schema change, would hit this same crash.
 cheap at this data size (Architecture P4), every command now self-heals a stale or missing
 schema instead of only `ingest` doing so; `_cmd_ingest`'s now-redundant explicit call was
 removed.
+
+---
+
+## 15. `recommend` against a brand-new, zero-gameweeks-played season crashed on `np.exp`
+
+**When:** Answering "can this be used before the season starts" by actually trying it —
+`fpl-optimizer recommend --season 2026-27 --gameweek 1 --model poisson` against the real,
+already-ingested live season (GW1's deadline hadn't passed yet).
+**Found by:** Running it — `TypeError: loop of ufunc does not support argument 0 of type
+float which has no callable exp method`, on the first attempt.
+**What happened:** `features/fixtures.py`'s `_team_rolling_stats` returns
+`pd.DataFrame(columns=["team_id", "goals_for_avg", "goals_against_avg", "clean_sheet_rate"])`
+when there are no finished fixtures yet to aggregate — the right *columns*, per entry #8's
+fix, but `pd.DataFrame(columns=[...])` with no data defaults every column to `object` dtype,
+not `float64`. `PoissonPredictor.predict()` then does
+`features["goals_against_avg"].fillna(1.5)`, which fills the values but does not change an
+object-dtype column back to a numeric one, and `np.exp()` on an object-dtype array raises
+instead of broadcasting elementwise. `form.py`/`minutes.py` already avoid this (their empty
+branches build the aggregate result via an explicit `pd.Series(dtype=float)`) — this one
+empty-fallback in `fixtures.py` was the one entry #8's fix didn't equally harden.
+**Fix:** Made `_team_rolling_stats`'s empty-fixtures branch construct each column with an
+explicit dtype (`pd.Series(dtype="float64")`, `dtype="int64"` for `team_id`) instead of bare
+`columns=[...]`. Regression test asserts the dtype directly rather than just the column set,
+since entry #8's existing schema test would not have caught this (it checks *presence*, not
+dtype).
+
+---
+
+## 16. Captain/vice-captain ids weren't JSON-serializable
+
+**When:** Same live run as entry #15, immediately after fixing it — the next `recommend`
+call to actually reach the persistence step added for M5.
+**Found by:** Running it (with `--model naive`, which doesn't touch `np.exp` and so got
+past entry #15's bug) — `TypeError: Object of type int64 is not JSON serializable` from
+`db.insert_recommendation`'s `json.dumps(payload)`.
+**What happened:** `optimize/lineup.py`'s `build_lineup` builds `starting_xi`/`bench` via
+`.tolist()` (which converts pandas' underlying numpy int64 values to plain Python ints), but
+`captain`/`vice_captain` via `starting_xi.iloc[0]["player_id"]` — scalar row access, which
+stays a numpy `int64`. That was invisible until M5 added a JSON payload; nothing before it
+ever serialized a recommendation to JSON.
+**Fix:** Wrapped both in `int(...)` in `lineup.py`, at the source, rather than defensively
+casting in every caller. Regression test asserts `type(...) is int` and round-trips through
+`json.dumps` directly, so this can't silently regress back to a numpy scalar.
