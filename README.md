@@ -18,12 +18,16 @@ Dependency versions are pinned in `requirements.lock.txt` (regenerate with `pip 
 ## Usage
 
 ```bash
+fpl-optimizer ingest   # M1: fetch current FPL state, write raw snapshots + parse into data/db/fpl.sqlite
+```
+
+Planned, not yet implemented (see milestones in the PRD):
+
+```bash
 fpl-optimizer recommend --gameweek 12
 fpl-optimizer backtest --season 2023-24
 fpl-optimizer evaluate --gameweek 11
 ```
-
-(Not yet implemented — see milestones in the PRD.)
 
 ## Tests
 
