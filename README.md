@@ -34,6 +34,25 @@ Every `recommend` run logs its predictions and full recommendation to the DB (FR
 P3) — that's what `evaluate` below reads.
 
 ```bash
+fpl-optimizer squad --season 2026-27                    # pull owned squad, selling prices, free transfers, chips for FPL_TEAM_ID
+fpl-optimizer plan --season 2026-27 --gameweek 3 --preset aggressive --risk 0.7
+```
+
+`squad` is what `plan` needs and only makes sense for the live season — it fetches your
+current squad from the FPL API (as of the last locked gameweek; there's no "current squad"
+before then) plus free transfers/chip status, both derived rather than pulled directly since
+FPL doesn't expose them as public fields (strategy/squad_state.py). `plan` is `recommend`'s
+transfer-aware sibling (M6, FR3/4/8): instead of picking a fresh 15, it plans a decayed 3-5
+gameweek horizon against your *owned* squad and commits only this gameweek's transfer +
+lineup decision (receding horizon control, PRD §6a.1) — `recommend` stays useful for
+wildcards and backtesting, where there's no continuity to respect. `--preset` (`balanced`
+default, `safe`/`aggressive`/`value_conscious` — PRD §6a.3) and `--risk` (overrides just the
+resolved preset's risk scalar) tune variance/differential/value tradeoffs without changing
+the underlying objective (every preset still maximizes expected points). Output also
+includes a chip-opportunities section — Bench Boost/Triple Captain/Wildcard/Free Hit, each
+with a reasoned expected-points delta, for whichever chips are still available.
+
+```bash
 fpl-optimizer train --season 2024-25 --train-start 2 --train-end 27 --test-start 28 --test-end 38 --save
 ```
 
