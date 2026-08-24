@@ -18,7 +18,7 @@ export default function SquadPage() {
       <form action={formAction} className="card p-6 flex items-end gap-3 mb-6">
         <div className="flex-1">
           <label className="label" htmlFor="season">Season</label>
-          <input className="input" id="season" name="season" placeholder="2025-26" required defaultValue="2025-26" />
+          <input className="input" id="season" name="season" placeholder="2026-27" required defaultValue="2026-27" />
         </div>
         <button className="btn btn-primary" type="submit" disabled={pending}>
           {pending ? "Syncing…" : "Sync from FPL"}
