@@ -25,7 +25,7 @@ export default function PlanPage() {
       <form action={formAction} className="card p-6 flex flex-wrap items-end gap-3 mb-6">
         <div>
           <label className="label" htmlFor="season">Season</label>
-          <input className="input" id="season" name="season" placeholder="2025-26" required defaultValue="2025-26" />
+          <input className="input" id="season" name="season" placeholder="2026-27" required defaultValue="2026-27" />
         </div>
         <div>
           <label className="label" htmlFor="gameweek">Gameweek</label>
