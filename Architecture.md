@@ -18,7 +18,7 @@ The single biggest failure mode in this kind of project is a system that backtes
 Not a chain of in-memory function calls. Raw data, features, predictions, and recommendations each get written to disk. This is what makes debugging, auditing, and evaluation possible after the fact — a season from now you need to answer "why did it tell me to sell Salah in GW12?"
 
 **P4. Simplicity over scale.**
-One user, one team, ~600 players, 38 gameweeks/season. That's tiny. Any decision justified by "but what if we scale" is almost certainly wrong here.
+A handful of users (§4.7), one team each, ~600 players, 38 gameweeks/season. That's tiny. Any decision justified by "but what if we scale" is almost certainly wrong here.
 
 ---
 
@@ -160,7 +160,7 @@ Archive fidelity is not uniform across fields, and the schema needs to make that
 
 **Choice: SQLite**, single file, with a `schema.sql` and simple forward-only migrations.
 
-**Justification:** the entire dataset is a few hundred MB at most — 600 players × 38 gameweeks × several seasons. Postgres would add a service to run, a connection to manage, and Docker to the setup, all to solve concurrency and scale problems that a single-user weekly batch job does not have. SQLite is a file, ships with Python, and is trivially backed up by copying it. If this ever becomes multi-user, swapping via SQLAlchemy is a contained change.
+**Justification:** the entire dataset is a few hundred MB at most — 600 players × 38 gameweeks × several seasons. Postgres would add a service to run, a connection to manage, and Docker to the setup, all to solve concurrency and scale problems that a handful-of-tenants weekly batch job does not have. SQLite is a file, ships with Python, and is trivially backed up by copying it. Multi-tenancy arrived at M8 (§4.7) without this swap — it turned out to be a data-model change (a `user_id` column), not a scale problem.
 
 **Core tables:**
 
