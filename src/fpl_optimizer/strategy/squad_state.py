@@ -13,13 +13,13 @@ from fpl_optimizer.storage import db
 ALL_CHIPS = ["wildcard", "freehit", "bboost", "3xc"]
 
 
-def resolve_purchase_price(conn, player_id: int, season: str) -> int | None:
-    """Most recent squad_transfers row bringing this player in (a player sold and re-bought
-    later has a new purchase price, hence "most recent" not "first"); falls back to the
-    earliest own_snapshot price for someone held since the season-opening 15, who never
-    appears in squad_transfers at all (schema.sql's own comment on that table). None if
-    neither source has anything — caller decides how to degrade (NFR2)."""
-    transfers_in = db.get_squad_transfers_in(conn, player_id)
+def resolve_purchase_price(conn, user_id: int, player_id: int, season: str) -> int | None:
+    """Most recent squad_transfers row bringing this player into `user_id`'s squad (a player
+    sold and re-bought later has a new purchase price, hence "most recent" not "first");
+    falls back to the earliest own_snapshot price for someone held since the season-opening
+    15, who never appears in squad_transfers at all (schema.sql's own comment on that
+    table). None if neither source has anything — caller decides how to degrade (NFR2)."""
+    transfers_in = db.get_squad_transfers_in(conn, user_id, player_id)
     if transfers_in:
         return transfers_in[0]["element_in_cost"]
     return db.get_earliest_own_snapshot_price(conn, player_id)

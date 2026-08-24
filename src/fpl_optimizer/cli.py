@@ -3,75 +3,73 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-import joblib
 import pandas as pd
 
 from fpl_optimizer import clock
-from fpl_optimizer.evaluation import backtest, metrics
+from fpl_optimizer.evaluation import accuracy_log
 from fpl_optimizer.features import build as feature_build
 from fpl_optimizer.ingestion import archive_loader, understat
 from fpl_optimizer.ingestion.fpl_api import FPLClient
 from fpl_optimizer.ingestion.snapshots import save_raw
-from fpl_optimizer.models import training_data
-from fpl_optimizer.models.baseline import NaivePredictor, PoissonPredictor
-from fpl_optimizer.models.ensemble import EnsemblePredictor
 from fpl_optimizer.optimize import constraints
+from fpl_optimizer.services import (
+    backtest_service, evaluate_service, ingest_service, plan_service,
+    predictor_service, recommend_service, squad_service, train_service,
+)
 from fpl_optimizer.storage import db
-from fpl_optimizer.strategy import chips, horizon, risk, squad_state
+from fpl_optimizer.strategy import risk
 
-PREDICTORS = {"naive": NaivePredictor, "poisson": PoissonPredictor}
-MODEL_CHOICES = [*sorted(PREDICTORS), "gbm"]
+PREDICTORS = predictor_service.PREDICTORS
+MODEL_CHOICES = predictor_service.MODEL_CHOICES
 CHIP_DISPLAY_NAMES = {"wildcard": "Wildcard", "freehit": "Free Hit", "bboost": "Bench Boost", "3xc": "Triple Captain"}
 
 DEFAULT_DB_PATH = Path("data/db/fpl.sqlite")
-DEFAULT_MODELS_DIR = Path("data/artifacts/models")
-ACCURACY_LOG_PATH = Path("data/artifacts/evaluation/accuracy_log.csv")
+DEFAULT_MODELS_DIR = predictor_service.DEFAULT_MODELS_DIR
+ACCURACY_LOG_PATH = accuracy_log.ACCURACY_LOG_PATH
 
 
-def infer_current_season(bootstrap: dict) -> str:
-    """FPL runs Aug-May; derive '2026-27' from GW1's deadline year rather than wall-clock
-    time, since that's a property of the data, not of when ingest happens to run."""
-    gw1_deadline = bootstrap["events"][0]["deadline_time"]
-    start_year = int(gw1_deadline[:4])
-    return f"{start_year}-{str(start_year + 1)[2:]}"
+def _resolve_local_admin_user(conn):
+    """The web app resolves user_id from a JWT (api/deps.py); the CLI has no login step, so
+    it resolves the same way `squad`/`recommend`/`plan` all need one: a single local admin
+    account, seeded once via `scripts/migrate_to_multitenant.py` and pointed at by
+    FPL_ADMIN_EMAIL in .env. `SystemExit` with setup instructions rather than a stack trace,
+    since this is a one-time local setup step, not a runtime failure (NFR2)."""
+    email = os.environ.get("FPL_ADMIN_EMAIL", "").strip()
+    if not email:
+        raise SystemExit("FPL_ADMIN_EMAIL not set in .env — required to resolve which account this CLI run acts as.")
+    user = db.get_user_by_email(conn, email)
+    if user is None:
+        raise SystemExit(
+            f"No account found for FPL_ADMIN_EMAIL={email!r}. Run `python scripts/migrate_to_multitenant.py "
+            "--email ... --password ...` once to create it."
+        )
+    return user
 
 
 def _cmd_ingest(args: argparse.Namespace) -> None:
     load_dotenv()
-    client = FPLClient()
-    now = datetime.now(timezone.utc)
-    today = now.strftime("%Y-%m-%d")
-
-    bootstrap = client.bootstrap_static()
-    save_raw("fpl_api", "bootstrap-static", bootstrap, when=now)
-    season = infer_current_season(bootstrap)
-
-    fixtures = client.fixtures()
-    save_raw("fpl_api", "fixtures", fixtures, when=now)
-
     conn = db.connect(args.db_path)  # connect() already ensures the schema is current
-    db.upsert_teams(conn, bootstrap["teams"])
-    db.upsert_element_types(conn, bootstrap["element_types"])
-    db.upsert_players(conn, bootstrap["elements"], updated_at=now.isoformat())
-    db.insert_player_snapshots(conn, bootstrap["elements"], snapshot_date=today, fetched_at=now.isoformat())
-    db.insert_fixtures(conn, fixtures, season=season)
+    summary = ingest_service.run_ingest(conn)
 
     print(
-        f"Ingested {len(bootstrap['elements'])} players, "
-        f"{len(bootstrap['teams'])} teams, {len(fixtures)} fixtures -> {args.db_path}"
+        f"Ingested {summary['players']} players, "
+        f"{summary['teams']} teams, {summary['fixtures']} fixtures -> {args.db_path}"
     )
 
+    # CLI-only convenience, not part of the shared service: a quick sanity check that the
+    # locally-configured team is reachable. The multi-tenant web app resolves this per
+    # account instead (see api/routers/squad.py), not from a single env var.
     team_id = os.environ.get("FPL_TEAM_ID", "").strip()
     if team_id:
         try:
+            client = FPLClient()
+            now = datetime.now(timezone.utc)
             entry = client.entry(int(team_id))
             save_raw("fpl_api", f"entry-{team_id}", entry, when=now)
             print(f'Fetched entry for team {team_id}: "{entry.get("name")}".')
@@ -94,72 +92,35 @@ def _cmd_bootstrap_season(args: argparse.Namespace) -> None:
 
 
 def _cmd_squad(args: argparse.Namespace) -> None:
-    """Owned-squad state ingestion (M6, FR1): current squad, purchase prices, free
-    transfers, chip status — the state `plan` needs and has never existed anywhere in the
-    app until now (squad_transfers has sat empty in the schema since M1)."""
+    """Owned-squad state ingestion (M6 FR1; multi-tenant since M8): current squad, purchase
+    prices, free transfers, chip status — the state `plan` needs. The CLI's single admin
+    account (seeded by `scripts/migrate_to_multitenant.py`) is resolved from FPL_TEAM_ID/
+    a --user-id-less local flow; the web app resolves this per authenticated account instead
+    (api/routers/squad.py)."""
     load_dotenv()
     team_id = os.environ.get("FPL_TEAM_ID", "").strip()
     if not team_id:
         raise SystemExit("FPL_TEAM_ID not set in .env — required for `squad`.")
     team_id = int(team_id)
 
-    client = FPLClient()
-    now = datetime.now(timezone.utc)
-
-    history = client.entry_history(team_id)
-    save_raw("fpl_api", f"entry-{team_id}-history", history, when=now)
-
-    if not history["current"]:
-        # NFR2: the season hasn't started yet (no gameweek has locked for this team) — there
-        # is no "current squad" to report. Not an error, just nothing to do yet.
-        raise SystemExit(f"No locked gameweeks yet for team {team_id} — the season hasn't started.")
-
-    last_locked_gw = max(row["event"] for row in history["current"])
-    last_locked_row = next(row for row in history["current"] if row["event"] == last_locked_gw)
-
-    transfers = client.entry_transfers(team_id)
-    save_raw("fpl_api", f"entry-{team_id}-transfers", transfers, when=now)
-
-    picks = client.entry_picks(team_id, last_locked_gw)
-    save_raw("fpl_api", f"entry-{team_id}-picks-gw{last_locked_gw}", picks, when=now)
-
     conn = db.connect(args.db_path)
+    try:
+        user = _resolve_local_admin_user(conn)
+    except SystemExit:
+        conn.close()
+        raise
 
-    db.insert_squad_transfers(conn, [
-        {
-            "event": t["event"], "element_in": t["element_in"], "element_in_cost": t["element_in_cost"],
-            "element_out": t["element_out"], "element_out_cost": t["element_out_cost"], "time": t["time"],
-        }
-        for t in transfers
-    ])
-
-    element_to_player = db.get_element_id_to_player_id_map(conn)
-    owned_rows = []
-    for pick in picks["picks"]:
-        player_id = element_to_player.get(pick["element"])
-        if player_id is None:
-            continue  # NFR2: an unrecognized element id shouldn't crash the whole ingest
-        owned_rows.append({
-            "player_id": player_id,
-            "is_starting": int(pick["position"] <= 11),
-            "is_captain": int(pick["is_captain"]),
-            "is_vice_captain": int(pick["is_vice_captain"]),
-            "purchase_price": squad_state.resolve_purchase_price(conn, player_id, args.season),
-        })
-    db.insert_owned_squad(conn, owned_rows, season=args.season, gameweek=last_locked_gw, recorded_at=now.isoformat())
-
-    free_transfers = squad_state.compute_free_transfers(history["current"], history["chips"])
-    chips_available = squad_state.resolve_chips_available(history["chips"])
-    db.insert_team_state(
-        conn, season=args.season, gameweek=last_locked_gw + 1, bank=last_locked_row.get("bank"),
-        free_transfers=free_transfers, chips_available=chips_available, recorded_at=now.isoformat(),
-    )
+    try:
+        summary = squad_service.sync_squad(conn, user_id=user["id"], team_id=team_id, season=args.season)
+    except ValueError as exc:
+        conn.close()
+        raise SystemExit(str(exc)) from exc
     conn.close()
 
-    print(f"Squad state for team {team_id}, {args.season}, as of GW{last_locked_gw}:")
-    print(f"  {len(owned_rows)} players, bank {(last_locked_row.get('bank') or 0) / 10:.1f}m")
-    print(f"  Free transfers available for GW{last_locked_gw + 1}: {free_transfers}")
-    print(f"  Chips available: {', '.join(chips_available) or 'none'}")
+    print(f"Squad state for team {team_id}, {args.season}, as of GW{summary['gameweek']}:")
+    print(f"  {summary['player_count']} players, bank {(summary['bank'] or 0) / 10:.1f}m")
+    print(f"  Free transfers available for GW{summary['next_gameweek']}: {summary['free_transfers']}")
+    print(f"  Chips available: {', '.join(summary['chips_available']) or 'none'}")
 
 
 def _cmd_understat(args: argparse.Namespace) -> None:
@@ -181,82 +142,46 @@ def _cmd_features(args: argparse.Namespace) -> None:
 
 
 def _load_predictor(args: argparse.Namespace):
-    """Baselines are stateless (fit() is a documented no-op); gbm loads a joblib model
-    already trained and saved by `train --save` — recommend never trains inline, training
-    is a separate lifecycle stage (strategy.horizon's own docstring)."""
-    if args.model == "gbm":
-        model_path = DEFAULT_MODELS_DIR / f"gbm_ensemble_{args.season}.joblib"
-        if not model_path.exists():
-            raise SystemExit(
-                f"No saved GBM model for {args.season} at {model_path} — "
-                f"run `fpl-optimizer train --season {args.season} ... --save` first."
-            )
-        return joblib.load(model_path)
-    predictor = PREDICTORS[args.model]()
-    predictor.fit(pd.DataFrame())
-    return predictor
+    try:
+        return predictor_service.load_predictor(args.model, args.season)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"{exc} (`fpl-optimizer train --season {args.season} ... --save`)") from exc
 
 
 def _cmd_recommend(args: argparse.Namespace) -> None:
+    load_dotenv()
     conn = db.connect(args.db_path)
-    the_clock = clock.FixedClock(args.as_of) if args.as_of else clock.SystemClock()
+    try:
+        user = _resolve_local_admin_user(conn)
+        the_clock = clock.FixedClock(args.as_of) if args.as_of else clock.SystemClock()
+        predictor = _load_predictor(args)
+        payload = recommend_service.run_recommend(
+            conn, the_clock, user_id=user["id"], season=args.season, gameweek=args.gameweek,
+            model=args.model, predictor=predictor,
+        )
+    finally:
+        conn.close()
 
-    predictor = _load_predictor(args)
+    def label(player: dict) -> str:
+        tag = (
+            " (C)" if player["player_id"] == payload["captain"]["player_id"]
+            else " (VC)" if player["player_id"] == payload["vice_captain"]["player_id"]
+            else ""
+        )
+        return f"{player['name']}{tag} — {player['expected_points']:.1f} xPts"
 
-    result = horizon.recommend_gameweek(conn, the_clock, args.season, args.gameweek, predictor)
-    usable = result["predictions"].dropna(subset=["element_type", "team_id", "now_cost", "expected_points"])
-    dropped = len(result["predictions"]) - len(usable)
-    squad_df, picked = result["squad"], result["lineup"]
-
-    names = {r["id"]: r["web_name"] for r in conn.execute("SELECT id, web_name FROM players").fetchall()}
-
-    def label(player_id: int) -> str:
-        pts = usable.loc[usable.player_id == player_id, "expected_points"].iloc[0]
-        tag = " (C)" if player_id == picked["captain"] else " (VC)" if player_id == picked["vice_captain"] else ""
-        return f"{names.get(player_id, f'#{player_id}')}{tag} — {pts:.1f} xPts"
-
-    def player_summary(player_id: int) -> dict:
-        pts = usable.loc[usable.player_id == player_id, "expected_points"].iloc[0]
-        return {"player_id": player_id, "name": names.get(player_id, f"#{player_id}"), "expected_points": float(pts)}
-
-    # Log every prediction and every recommendation made (FR6, Architecture P3) — this is
-    # the data `evaluate` later joins against real outcomes.
-    prediction_rows = usable[["player_id", "expected_points", "p_start", "std_dev"]].to_dict("records")
-    db.insert_predictions(
-        conn, prediction_rows, model_version=args.model, season=args.season,
-        gameweek=args.gameweek, run_date=result["as_of_date"],
-    )
-    run_id = uuid.uuid4().hex
-    payload = {
-        "season": args.season,
-        "gameweek": args.gameweek,
-        "model": args.model,
-        "as_of_date": result["as_of_date"],
-        "squad_cost": float(squad_df["now_cost"].sum()),
-        "squad_expected_points": float(squad_df["expected_points"].sum()),
-        "starting_xi": [player_summary(pid) for pid in picked["starting_xi"]],
-        "bench": [player_summary(pid) for pid in picked["bench"]],
-        "captain": player_summary(picked["captain"]),
-        "vice_captain": player_summary(picked["vice_captain"]),
-    }
-    db.insert_recommendation(
-        conn, run_id, created_at=datetime.now(timezone.utc).isoformat(),
-        season=args.season, gameweek=args.gameweek, payload=payload,
-    )
-    conn.close()
-
-    print(f"Recommendation for {args.season} GW{args.gameweek} ({args.model} model, as of {result['as_of_date']})")
-    if dropped:
-        print(f"  ({dropped} players excluded — missing price/position/prediction data)")
-    print(f"  Squad cost: {squad_df['now_cost'].sum() / 10:.1f}m / {constraints.BUDGET / 10:.1f}m")
-    print(f"  Squad expected points: {squad_df['expected_points'].sum():.1f}")
+    print(f"Recommendation for {args.season} GW{args.gameweek} ({args.model} model, as of {payload['as_of_date']})")
+    if payload["dropped_players"]:
+        print(f"  ({payload['dropped_players']} players excluded — missing price/position/prediction data)")
+    print(f"  Squad cost: {payload['squad_cost'] / 10:.1f}m / {constraints.BUDGET / 10:.1f}m")
+    print(f"  Squad expected points: {payload['squad_expected_points']:.1f}")
     print("\n  Starting XI:")
-    for player_id in picked["starting_xi"]:
-        print(f"    {label(player_id)}")
+    for player in payload["starting_xi"]:
+        print(f"    {label(player)}")
     print("  Bench:")
-    for player_id in picked["bench"]:
-        print(f"    {label(player_id)}")
-    print(f"\n  Logged {len(prediction_rows)} predictions and recommendation {run_id} for later `evaluate`.")
+    for player in payload["bench"]:
+        print(f"    {label(player)}")
+    print(f"\n  Logged {payload['predictions_logged']} predictions and recommendation {payload['run_id']} for later `evaluate`.")
 
 
 def _cmd_plan(args: argparse.Namespace) -> None:
@@ -264,137 +189,82 @@ def _cmd_plan(args: argparse.Namespace) -> None:
     Distinct from `recommend`, which picks a fresh 15 from scratch (still useful for
     wildcards and backtesting) — `plan` requires `squad` to have been run first, same
     pattern `evaluate` already uses for `results`."""
+    load_dotenv()
     conn = db.connect(args.db_path)
-    the_clock = clock.FixedClock(args.as_of) if args.as_of else clock.SystemClock()
-
-    team_state_row = db.get_team_state(conn, args.season, args.gameweek)
-    owned_rows = db.get_owned_squad(conn, args.season, args.gameweek - 1)
-    if team_state_row is None or not owned_rows:
+    try:
+        user = _resolve_local_admin_user(conn)
+        the_clock = clock.FixedClock(args.as_of) if args.as_of else clock.SystemClock()
+        preset = risk.resolve_preset(args.preset or risk.default_preset_name())
+        if args.risk is not None:
+            preset = {**preset, "risk": args.risk}
+        predictor = _load_predictor(args)
+        try:
+            payload = plan_service.run_plan(
+                conn, the_clock, user_id=user["id"], season=args.season, gameweek=args.gameweek,
+                model=args.model, predictor=predictor, preset=preset,
+            )
+        except plan_service.PlanNotReady as exc:
+            raise SystemExit(f"{exc} (run `fpl-optimizer squad` first.)") from exc
+    finally:
         conn.close()
-        raise SystemExit(
-            f"No squad state for {args.season} GW{args.gameweek} — run `fpl-optimizer squad` first."
+
+    def label(player: dict) -> str:
+        pts_str = f"{player['expected_points']:.1f} xPts" if player["expected_points"] is not None else "? xPts"
+        tag = (
+            " (C)" if player["player_id"] == payload["captain"]["player_id"]
+            else " (VC)" if player["player_id"] == payload["vice_captain"]["player_id"]
+            else ""
         )
-
-    current_prices = {r["player_id"]: r["now_cost"] for r in db.get_player_snapshots_as_of(conn, the_clock.today())}
-    owned_squad = pd.DataFrame([
-        {
-            "player_id": r["player_id"],
-            # Selling price is recomputed from the latest known price, not frozen at
-            # `squad` ingest time — price moves between when you last checked and now.
-            # An unresolved purchase_price (NFR2) falls back to current price (break-even).
-            "selling_price": (
-                constraints.selling_price(r["purchase_price"], current_prices[r["player_id"]])
-                if r["purchase_price"] is not None and r["player_id"] in current_prices
-                else current_prices.get(r["player_id"], r["purchase_price"])
-            ),
-        }
-        for r in owned_rows
-    ])
-
-    preset = risk.resolve_preset(args.preset or risk.default_preset_name())
-    if args.risk is not None:
-        preset = {**preset, "risk": args.risk}
-
-    predictor = _load_predictor(args)
-    result = horizon.plan_horizon(
-        conn, the_clock, args.season, args.gameweek, predictor, owned_squad,
-        bank=team_state_row["bank"] or 0, free_transfers=team_state_row["free_transfers"],
-        preset=preset,
-    )
-    transfer_result, picked = result["transfer_result"], result["lineup"]
-    week1 = result["weekly_predictions"][0]["predictions"]
-
-    chips_available = json.loads(team_state_row["chips_available"] or "[]")
-    chip_scenarios = chips.evaluate_chip_scenarios(
-        result, owned_squad, bank=team_state_row["bank"] or 0, chips_available=chips_available
-    )
-
-    names = {r["id"]: r["web_name"] for r in conn.execute("SELECT id, web_name FROM players").fetchall()}
-    conn.close()
-
-    def label(player_id: int) -> str:
-        pts = week1.loc[week1.player_id == player_id, "expected_points"]
-        pts_str = f"{pts.iloc[0]:.1f} xPts" if len(pts) else "? xPts"
-        tag = " (C)" if player_id == picked["captain"] else " (VC)" if player_id == picked["vice_captain"] else ""
-        return f"{names.get(player_id, f'#{player_id}')}{tag} — {pts_str}"
+        return f"{player['name']}{tag} — {pts_str}"
 
     preset_name = args.preset or risk.default_preset_name()
-    print(f"Plan for {args.season} GW{args.gameweek} ({args.model} model, {preset_name} preset, as of {result['as_of_date']})")
-    if transfer_result["transfers_in"]:
+    print(f"Plan for {args.season} GW{args.gameweek} ({args.model} model, {preset_name} preset, as of {payload['as_of_date']})")
+    if payload["transfers_in"]:
         print("\n  Transfers:")
-        for out_id, in_id in zip(transfer_result["transfers_out"], transfer_result["transfers_in"]):
-            print(f"    OUT {names.get(out_id, f'#{out_id}')}  ->  IN {names.get(in_id, f'#{in_id}')}")
-        print(f"  Hits taken: {transfer_result['hits_taken']} (-{transfer_result['hit_cost']} pts)")
-        print(f"  Net expected points gain (horizon, net of hits): {transfer_result['expected_points_gain']:.1f}")
+        for out_name, in_name in zip(payload["transfers_out"], payload["transfers_in"]):
+            print(f"    OUT {out_name}  ->  IN {in_name}")
+        print(f"  Hits taken: {payload['hits_taken']} (-{payload['hit_cost']} pts)")
+        print(f"  Net expected points gain (horizon, net of hits): {payload['expected_points_gain']:.1f}")
     else:
         print("\n  Hold — no transfer clears the hit threshold this week.")
     print("\n  Starting XI:")
-    for player_id in picked["starting_xi"]:
-        print(f"    {label(player_id)}")
+    for player in payload["starting_xi"]:
+        print(f"    {label(player)}")
     print("  Bench:")
-    for player_id in picked["bench"]:
-        print(f"    {label(player_id)}")
+    for player in payload["bench"]:
+        print(f"    {label(player)}")
 
-    if chip_scenarios:
+    if payload["chip_scenarios"]:
         print("\n  Chip opportunities:")
-        for chip_name, scenario in chip_scenarios.items():
+        for chip_name, scenario in payload["chip_scenarios"].items():
             print(f"    {CHIP_DISPLAY_NAMES.get(chip_name, chip_name)}: {scenario['delta']:+.1f} pts — {scenario['reasoning']}")
 
 
 def _cmd_train(args: argparse.Namespace) -> None:
     conn = db.connect(args.db_path)
-
     print(f"Building training set: {args.season} GW{args.train_start}-{args.train_end}...")
-    train_features, train_targets = training_data.build_training_set(
-        conn, args.season, range(args.train_start, args.train_end + 1)
-    )
-    print(f"  {len(train_features)} (player, gameweek) rows")
-
     print(f"Building held-out set: {args.season} GW{args.test_start}-{args.test_end}...")
-    test_features, test_targets = training_data.build_training_set(
-        conn, args.season, range(args.test_start, args.test_end + 1)
-    )
-    print(f"  {len(test_features)} (player, gameweek) rows")
-    conn.close()
+    try:
+        result = train_service.run_train(
+            conn, args.season, args.train_start, args.train_end, args.test_start, args.test_end, args.save,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    finally:
+        conn.close()
 
-    if train_features.empty or test_features.empty:
-        raise SystemExit("Not enough data to train/evaluate — check the season and gameweek ranges.")
-
-    ensemble = EnsemblePredictor()
-    results = {}
-    for name, predictor in [("naive", NaivePredictor()), ("poisson", PoissonPredictor()), ("gbm_ensemble", ensemble)]:
-        predictor.fit(train_features, train_targets)
-        predictions = predictor.predict(test_features)
-        merged = predictions.merge(test_targets[["player_id", "gameweek", "total_points"]], on=["player_id", "gameweek"])
-        results[name] = (merged["expected_points"] - merged["total_points"]).abs().mean()
-
+    print(f"  {result['train_rows']} train rows, {result['test_rows']} held-out rows")
     print(f"\nMean Absolute Error on GW{args.test_start}-{args.test_end} (lower is better):")
-    for name, mae in sorted(results.items(), key=lambda kv: kv[1]):
+    for name, mae in sorted(result["mae_by_model"].items(), key=lambda kv: kv[1]):
         print(f"  {name}: {mae:.3f}")
-
-    if args.save:
-        DEFAULT_MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        model_path = DEFAULT_MODELS_DIR / f"gbm_ensemble_{args.season}.joblib"
-        joblib.dump(ensemble, model_path)
-        print(f"\nSaved trained ensemble -> {model_path}")
+    if result["saved_path"]:
+        print(f"\nSaved trained ensemble -> {result['saved_path']}")
 
 
 def _cmd_backtest(args: argparse.Namespace) -> None:
     conn = db.connect(args.db_path)
-
-    if args.model == "gbm":
-        # Train only on gameweeks strictly before the backtest window — training on data
-        # that overlaps it would leak the backtest's own future into itself.
-        print(f"Training GBM ensemble on {args.season} GW2-{args.start_gameweek - 1}...")
-        train_features, train_targets = training_data.build_training_set(conn, args.season, range(2, args.start_gameweek))
-        predictor = EnsemblePredictor()
-        predictor.fit(train_features, train_targets)
-    else:
-        predictor = PREDICTORS[args.model]()
-        predictor.fit(pd.DataFrame())  # stateless baseline; fit() is a documented no-op
-
     print(f"Backtesting {args.season} GW{args.start_gameweek}-{args.end_gameweek} ({args.model})...")
-    results = backtest.backtest_season(conn, args.season, args.start_gameweek, args.end_gameweek, predictor)
+    results = backtest_service.run_backtest(conn, args.season, args.start_gameweek, args.end_gameweek, args.model)
     conn.close()
 
     if results.empty:
@@ -427,68 +297,24 @@ def _cmd_results(args: argparse.Namespace) -> None:
     print(f"Ingested results for {args.season} GW{args.gameweek}: {n} players.")
 
 
-def _append_accuracy_log(rows: list[dict]) -> None:
-    """Appends one summary row per model to the running accuracy log (Architecture §4.8) —
-    the persisted trend line `evaluate` builds up over a season. Re-evaluating the same
-    (season, gameweek, model_version) updates that row in place rather than duplicating.
-    """
-    ACCURACY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    new_rows = pd.DataFrame(rows)
-    key = ["season", "gameweek", "model_version"]
-    if ACCURACY_LOG_PATH.exists():
-        existing = pd.read_csv(ACCURACY_LOG_PATH)
-        existing = existing[~existing.set_index(key).index.isin(new_rows.set_index(key).index)]
-        combined = pd.concat([existing, new_rows], ignore_index=True)
-    else:
-        combined = new_rows
-    combined.sort_values(key).to_csv(ACCURACY_LOG_PATH, index=False)
-    print(f"\nAppended to {ACCURACY_LOG_PATH}")
-
-
 def _cmd_evaluate(args: argparse.Namespace) -> None:
     conn = db.connect(args.db_path)
-    predictions = db.get_latest_predictions(conn, args.season, args.gameweek, model_version=args.model)
-    actual_rows = db.get_player_gw_stats_for_gameweek(conn, args.season, args.gameweek)
-    # element_type isn't stored on predictions (it's a slowly-changing player attribute,
-    # not part of a prediction) — fetched separately for the by-position breakdown below.
-    element_types = {r["id"]: r["element_type"] for r in conn.execute("SELECT id, element_type FROM players")}
-    conn.close()
-
-    if not predictions:
-        raise SystemExit(
-            f"No logged predictions for {args.season} GW{args.gameweek} — run `fpl-optimizer recommend` for it first."
-        )
-    if not actual_rows:
-        raise SystemExit(
-            f"No recorded results for {args.season} GW{args.gameweek} — run `fpl-optimizer results` for it first."
-        )
-
-    predictions_df = pd.DataFrame([dict(r) for r in predictions])
-    predictions_df["element_type"] = predictions_df["player_id"].map(element_types)
-    actuals_df = pd.DataFrame([dict(r) for r in actual_rows])
+    try:
+        result = evaluate_service.run_evaluate(conn, args.season, args.gameweek, args.model)
+    except evaluate_service.EvaluateNotReady as exc:
+        raise SystemExit(str(exc)) from exc
+    finally:
+        conn.close()
 
     print(f"Evaluation for {args.season} GW{args.gameweek}:")
-    log_rows = []
-    for model_version, group in predictions_df.groupby("model_version"):
-        overall = metrics.overall_mae_rmse(group, actuals_df)
+    for model_version, model_result in result["by_model"].items():
+        overall = model_result["overall"]
         print(f"\n  {model_version}: MAE {overall['mae']:.3f}   RMSE {overall['rmse']:.3f}   (n={overall['n']})")
-        print(metrics.mae_rmse_by_position(group, actuals_df).to_string(index=False))
-
-        if group["p_start"].notna().any():
+        print(pd.DataFrame(model_result["by_position"]).to_string(index=False))
+        if model_result["minutes_calibration"] is not None:
             print("  Minutes calibration:")
-            print(metrics.minutes_calibration(group, actuals_df).to_string(index=False))
-
-        log_rows.append({
-            "season": args.season,
-            "gameweek": args.gameweek,
-            "model_version": model_version,
-            "evaluated_at": datetime.now(timezone.utc).isoformat(),
-            "n": overall["n"],
-            "mae": overall["mae"],
-            "rmse": overall["rmse"],
-        })
-
-    _append_accuracy_log(log_rows)
+            print(pd.DataFrame(model_result["minutes_calibration"]).to_string(index=False))
+    print(f"\nAppended to {accuracy_log.ACCURACY_LOG_PATH}")
 
 
 def build_parser() -> argparse.ArgumentParser:

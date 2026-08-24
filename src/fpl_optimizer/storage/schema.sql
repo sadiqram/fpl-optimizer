@@ -3,6 +3,18 @@
 
 PRAGMA foreign_keys = ON;
 
+-- Accounts (web app, M8). Only the owned-squad layer below is tenant-scoped — players,
+-- teams, fixtures, predictions, and model artifacts are shared FPL-wide facts, not per-user
+-- data, so they carry no user_id. fpl_team_id is nullable: an account exists before it's
+-- connected to a real FPL team (onboarding step).
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    email         TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    fpl_team_id   INTEGER,
+    created_at    TEXT NOT NULL
+);
+
 -- Reference data: teams and positions. Slowly-changing, re-synced on every ingest.
 -- Unlike players, team id is treated as stable here — empirically verified against
 -- promoted/relegated clubs across 2022-23..2024-25 (id held even as other teams changed
@@ -150,11 +162,30 @@ CREATE TABLE IF NOT EXISTS predictions (
 
 CREATE TABLE IF NOT EXISTS recommendations (
     run_id     TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
     created_at TEXT NOT NULL,
     season     TEXT NOT NULL,
     gameweek   INTEGER NOT NULL,
     payload    TEXT NOT NULL  -- full recommendation output + rationale, as JSON
 );
+CREATE INDEX IF NOT EXISTS idx_recommendations_user_season_gw
+    ON recommendations (user_id, season, gameweek);
+
+-- `plan_horizon` output (M8) — mirrors `recommendations` but for the rolling-horizon
+-- transfer/lineup/chip-scenario plan, which previously wasn't persisted anywhere (only
+-- printed by `_cmd_plan`). Kept as a separate table rather than folding into
+-- `recommendations` since the payload shape is materially different (transfers, hits,
+-- chip scenarios vs. a single-gameweek squad pick).
+CREATE TABLE IF NOT EXISTS plan_runs (
+    run_id     TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    season     TEXT NOT NULL,
+    gameweek   INTEGER NOT NULL,
+    payload    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_runs_user_season_gw
+    ON plan_runs (user_id, season, gameweek);
 
 -- Purchase-price tracking for selling-price correctness (PRD §11 "Still open",
 -- folded into M1). Mirrors the FPL entry/transfers/ response shape. The season-opening
@@ -163,19 +194,21 @@ CREATE TABLE IF NOT EXISTS recommendations (
 -- day one matters (Architecture "M1 urgency" note).
 CREATE TABLE IF NOT EXISTS squad_transfers (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id          INTEGER NOT NULL REFERENCES users(id),
     event            INTEGER NOT NULL,
     element_in       INTEGER NOT NULL REFERENCES players(id),
     element_in_cost  INTEGER NOT NULL,
     element_out      INTEGER REFERENCES players(id),
     element_out_cost INTEGER,
     time             TEXT NOT NULL,
-    UNIQUE (element_in, element_out, time)
+    UNIQUE (user_id, element_in, element_out, time)
 );
 
 -- Owned-squad snapshots (M6, FR1) — point-in-time, same spirit as player_snapshots.
 -- `gameweek` is the last-locked gameweek this snapshot reflects (entry/{id}/event/{gw}/picks/
 -- 404s before its own deadline passes, so "current squad" is always as-of the previous lock).
 CREATE TABLE IF NOT EXISTS owned_squad (
+    user_id          INTEGER NOT NULL REFERENCES users(id),
     season           TEXT NOT NULL,
     gameweek         INTEGER NOT NULL,
     player_id        INTEGER NOT NULL REFERENCES players(id),
@@ -184,18 +217,19 @@ CREATE TABLE IF NOT EXISTS owned_squad (
     is_vice_captain  INTEGER NOT NULL,
     purchase_price   INTEGER,  -- 0.1m units; NULL if unresolved (see squad_state.resolve_purchase_price)
     recorded_at      TEXT NOT NULL,
-    PRIMARY KEY (season, gameweek, player_id)
+    PRIMARY KEY (user_id, season, gameweek, player_id)
 );
 
 -- Derived team state (M6, FR1) — bank/free transfers/chips, computed once at `squad` ingest
 -- time (banking-rule simulation + chip-history lookup) rather than re-derived on every
 -- `plan` run. `gameweek` is the upcoming/undecided gameweek this state applies to.
 CREATE TABLE IF NOT EXISTS team_state (
+    user_id          INTEGER NOT NULL REFERENCES users(id),
     season           TEXT NOT NULL,
     gameweek         INTEGER NOT NULL,
     bank             INTEGER,  -- 0.1m units
     free_transfers   INTEGER,
     chips_available  TEXT,     -- JSON list, e.g. ["wildcard","bboost","3xc","freehit"]
     recorded_at      TEXT NOT NULL,
-    PRIMARY KEY (season, gameweek)
+    PRIMARY KEY (user_id, season, gameweek)
 );

@@ -83,6 +83,52 @@ MAE/RMSE overall and by position, plus minutes calibration, per logged model —
 to filter to one. Each run appends a summary row to `data/artifacts/evaluation/accuracy_log.csv`
 (Architecture §4.8, "Live tracking").
 
+## Web app (M8)
+
+A FastAPI backend + Next.js frontend, primary interface for live/multi-tenant use once
+deployed (Architecture §4.7). The CLI above stays the local/dev/backtest entry point — both
+call the same `src/fpl_optimizer/services/` layer, so behavior never diverges between them.
+
+**One-time: migrate an existing DB to multi-tenant** (adds `users`/`plan_runs`, threads
+`user_id` through the owned-squad tables; safe to re-run, no-op if already migrated):
+
+```bash
+python scripts/migrate_to_multitenant.py --email you@example.com --password '...'
+```
+
+Then set `FPL_ADMIN_EMAIL` in `.env` to that email — the CLI resolves which account it acts
+as from that (`squad`/`recommend`/`plan` all need one now); the web app resolves it from a
+JWT instead.
+
+Also set `ADMIN_EMAILS` (comma-separated) to the account(s) allowed to call `POST /train`:
+that endpoint retrains and can overwrite the single shared model artifact every tenant's
+`/recommendations` and `/plans` load, so it's gated to an allowlist rather than any
+authenticated account.
+
+**Run locally:**
+
+```bash
+# backend — from the repo root, same venv as the CLI
+JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))") uvicorn fpl_optimizer.api.main:app --reload --port 8000
+
+# frontend — separate terminal
+cd frontend
+cp .env.example .env.local   # BACKEND_URL=http://localhost:8000 by default
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`, register an account, connect an FPL team ID (Settings), then
+sync your squad.
+
+**Deploy:** `Dockerfile` + `fly.toml` build the backend for Fly.io (comments in `fly.toml`
+have the exact commands — volume for the SQLite file, secrets for `JWT_SECRET`/`FPL_TEAM_ID`/
+`CORS_ORIGIN`); the frontend deploys to Vercel with `BACKEND_URL` pointed at the deployed
+backend. Neither config has been run against a real Fly.io/Vercel account yet — verify
+`fly config validate` and a real `fly deploy` before trusting it in production. The backend
+runs one machine always-on (not scale-to-zero) so `api/scheduler.py`'s daily refresh — the
+actual fix for the WSL-cron problem that started this — can't be silently skipped.
+
 ## Tests
 
 ```bash

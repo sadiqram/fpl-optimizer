@@ -19,7 +19,13 @@ Build a system that recommends, each gameweek, the optimal:
 ## 3. Non-Goals (v1)
 
 - **Not** fully autonomous execution — no auto-submitting transfers via FPL's private API. Human stays in the loop to review and confirm. (Revisit post-v1 if trust in the system is established.)
-- **Not** a multi-user product/SaaS — single user (you), single team, to start.
+- ~~Not a multi-user product/SaaS — single user (you), single team, to start.~~ **Revised at
+  M8**: the web app (Architecture §4.7) is multi-tenant — each account connects its own FPL
+  team and gets its own squad/plan/recommendation history. What's still true from the
+  original non-goal: this isn't opponent-aware or league-strategy-aware across accounts (see
+  §6a.2/§6a.3 below, unchanged), and it's still not a hosted SaaS with billing, support, or
+  onboarding beyond a login screen — multi-tenant here means "more than one person can use
+  it," not "productized."
 - **Not** predicting live in-match events (bonus points, red cards) in real time — weekly cadence, not live.
 - **Not** full mini-league game theory (modelling specific rivals' squads and playing directly against them). v1 handles league context only through a single risk parameter (see §6a), not opponent-by-opponent strategy.
 - **Not** automatic inference of risk appetite from league standings in v1 — the parameter exists and the interface supports it, but v1 ships manual-only. See §6a.2.
@@ -171,7 +177,7 @@ Consequences:
 
 ## 10. Milestones (proposed)
 
-**Status (2026-08-04): M0–M6 done. M7 is deliberately deferred — see its entry below, not just unscheduled.**
+**Status (2026-08-24): M0–M6 and M8 done. M7 is deliberately deferred, out of order — see its entry below, not just unscheduled.**
 
 0. **Kickoff housekeeping** — done: dependency manager + pinned deps, `.env.example` with real `FPL_TEAM_ID`, repo scaffold, test runner. Small, but cheaper now than mid-build.
 1. **Data layer** — done: pull + store FPL API data; begin own snapshot accumulation immediately (every day of delay is history you can't recover). Evaluate archive sources and verify update cadence per §6a.4. Track purchase price per player from day one for selling-price correctness.
@@ -181,7 +187,8 @@ Consequences:
 5. **Weekly live run** — done: use it for real, log predictions vs. outcomes.
 6. **Strategy layer** — done: rolling-horizon transfers + chip timing logic (`fpl-optimizer squad`/`plan`, presets, chip scenario comparison).
 7. **Auto-infer risk parameter** — **deferred**, not just next in line. Adding the second writer to the risk scalar was meant to be "calibrated against M4's harness," but M4's backtest harness and M6's season simulator only ever replay *archived* seasons using the model's own predictions — this project has never tracked a mini-league's rivals, historically or live, so there is no real `(gap, GW remaining, swing)` data to calibrate a mapping against yet (exactly the overfitting risk already named below). Revisit once the live season has started and a real mini-league's standings have actually been snapshotted for a few gameweeks — not before.
-8. **(Stretch) Auto-execution**: revisit only after M1–M7 prove reliable and trustworthy.
+8. **Web app** — done: FastAPI + Next.js becomes the primary interface for live use (built out of milestone order relative to M7, deliberately — see M7's own deferral above and Architecture §4.7 for the full rationale). CLI business logic extracted to a shared `services/` layer so the CLI and API never diverge (Architecture P2 extended to the interface layer). Multi-tenant: each account connects its own FPL team (revises the §3 non-goal above). Not yet deployed to a real Fly.io/Vercel account — see README's "Web app" section for what's left.
+9. **(Stretch) Auto-execution**: revisit only after M1–M7 (and now M8) prove reliable and trustworthy.
 
 **Note on M1 urgency:** snapshot accumulation is the one task where starting earlier strictly dominates. Everything else can be built in any order; snapshots can only be collected forward in time.
 

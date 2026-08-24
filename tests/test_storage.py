@@ -148,11 +148,22 @@ def test_get_latest_predictions_filters_by_model_version(conn):
 
 
 def test_insert_recommendation_roundtrip(conn):
+    user_id = db.create_user(conn, email="a@example.com", password_hash="x", created_at="2025-09-01T00:00:00Z")
     payload = {"squad_expected_points": 65.5, "captain": {"player_id": 1}}
-    db.insert_recommendation(conn, "run-1", created_at="2025-09-01T12:00:00Z", season="2025-26", gameweek=3, payload=payload)
+    db.insert_recommendation(conn, "run-1", user_id=user_id, created_at="2025-09-01T12:00:00Z", season="2025-26", gameweek=3, payload=payload)
     row = conn.execute("SELECT * FROM recommendations WHERE run_id = 'run-1'").fetchone()
     assert row["season"] == "2025-26"
     assert json.loads(row["payload"]) == payload
+    assert db.get_recommendation(conn, "run-1")["run_id"] == "run-1"
+    assert [r["run_id"] for r in db.list_recommendations(conn, user_id)] == ["run-1"]
+
+
+def test_user_crud(conn):
+    user_id = db.create_user(conn, email="Test@Example.com", password_hash="hash", created_at="2025-09-01T00:00:00Z")
+    assert db.get_user_by_email(conn, "test@example.com")["id"] == user_id
+    assert db.get_user_by_id(conn, user_id)["email"] == "test@example.com"
+    db.update_user_fpl_team_id(conn, user_id, 2786467)
+    assert db.get_user_by_id(conn, user_id)["fpl_team_id"] == 2786467
 
 
 def test_insert_event_live_stats_maps_element_id_and_skips_unmapped(conn):

@@ -17,7 +17,13 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     would 500 the first time `recommend`/`evaluate`/anything else touched the new table,
     since only `_cmd_ingest` used to call init_db (docs/error_log.md, M5 entry)."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    # check_same_thread=False: FastAPI (api/deps.py's get_conn) dispatches each sync
+    # dependency and route body via anyio's threadpool independently, so the thread that
+    # opens a request's connection isn't guaranteed to be the same one that later uses it —
+    # sqlite3's default same-thread check would raise ProgrammingError on that, even though
+    # actual usage within one request is still sequential, never concurrent. The CLI and
+    # tests are single-threaded, so this is a no-op for them.
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     init_db(conn)
@@ -458,46 +464,102 @@ def get_latest_predictions(
 
 
 def insert_recommendation(
-    conn: sqlite3.Connection, run_id: str, created_at: str, season: str, gameweek: int, payload: dict
+    conn: sqlite3.Connection, run_id: str, user_id: int, created_at: str, season: str, gameweek: int, payload: dict
 ) -> None:
     """Persists the full recommendation output + rationale as JSON (Architecture §4.2,
     P3: every intermediate artifact is persisted). One row per run — reruns get a fresh
     run_id rather than overwriting, so the history of what was actually recommended, and
     when, is never lost."""
     conn.execute(
-        "INSERT INTO recommendations (run_id, created_at, season, gameweek, payload) VALUES (?, ?, ?, ?, ?)",
-        (run_id, created_at, season, gameweek, json.dumps(payload)),
+        "INSERT INTO recommendations (run_id, user_id, created_at, season, gameweek, payload) VALUES (?, ?, ?, ?, ?, ?)",
+        (run_id, user_id, created_at, season, gameweek, json.dumps(payload)),
     )
     conn.commit()
 
 
-def insert_squad_transfers(conn: sqlite3.Connection, rows: list[dict]) -> None:
+def get_recommendation(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM recommendations WHERE run_id = ?", (run_id,)).fetchone()
+
+
+def list_recommendations(
+    conn: sqlite3.Connection, user_id: int, season: str | None = None, gameweek: int | None = None
+) -> list[sqlite3.Row]:
+    """Most recent first — the natural order for a history view. season/gameweek are
+    optional filters (unlike the as-of-date parameters elsewhere in this module, this isn't
+    a leakage boundary, just a query convenience)."""
+    query = "SELECT * FROM recommendations WHERE user_id = ?"
+    params: list = [user_id]
+    if season is not None:
+        query += " AND season = ?"
+        params.append(season)
+    if gameweek is not None:
+        query += " AND gameweek = ?"
+        params.append(gameweek)
+    query += " ORDER BY created_at DESC"
+    return conn.execute(query, params).fetchall()
+
+
+def insert_plan_run(
+    conn: sqlite3.Connection, run_id: str, user_id: int, created_at: str, season: str, gameweek: int, payload: dict
+) -> None:
+    """Persists `plan_horizon` output — previously only printed by `_cmd_plan`, never
+    saved (unlike `recommend`). Mirrors insert_recommendation."""
+    conn.execute(
+        "INSERT INTO plan_runs (run_id, user_id, created_at, season, gameweek, payload) VALUES (?, ?, ?, ?, ?, ?)",
+        (run_id, user_id, created_at, season, gameweek, json.dumps(payload)),
+    )
+    conn.commit()
+
+
+def get_plan_run(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM plan_runs WHERE run_id = ?", (run_id,)).fetchone()
+
+
+def list_plan_runs(
+    conn: sqlite3.Connection, user_id: int, season: str | None = None, gameweek: int | None = None
+) -> list[sqlite3.Row]:
+    query = "SELECT * FROM plan_runs WHERE user_id = ?"
+    params: list = [user_id]
+    if season is not None:
+        query += " AND season = ?"
+        params.append(season)
+    if gameweek is not None:
+        query += " AND gameweek = ?"
+        params.append(gameweek)
+    query += " ORDER BY created_at DESC"
+    return conn.execute(query, params).fetchall()
+
+
+def insert_squad_transfers(conn: sqlite3.Connection, rows: list[dict], user_id: int) -> None:
     """rows: raw `entry/{id}/transfers/` items — element_in, element_in_cost, element_out,
     element_out_cost, event, time. Doesn't include the season-opening 15 (schema.sql's own
     comment on this table) — those are resolved from the earliest own_snapshot instead, see
-    squad_state.resolve_purchase_price. Upsert on (element_in, element_out, time) — FPL never
-    returns the same transfer twice, but re-running `squad` on the same history must not
-    duplicate rows."""
+    squad_state.resolve_purchase_price. Upsert on (user_id, element_in, element_out, time) —
+    FPL never returns the same transfer twice, but re-running `squad` on the same history
+    must not duplicate rows. user_id scopes this to one account's transfer history now that
+    the app is multi-tenant (PRD/Architecture M8)."""
+    payload = [{**row, "user_id": user_id} for row in rows]
     conn.executemany(
         """
-        INSERT INTO squad_transfers (event, element_in, element_in_cost, element_out, element_out_cost, time)
-        VALUES (:event, :element_in, :element_in_cost, :element_out, :element_out_cost, :time)
-        ON CONFLICT(element_in, element_out, time) DO UPDATE SET
+        INSERT INTO squad_transfers (user_id, event, element_in, element_in_cost, element_out, element_out_cost, time)
+        VALUES (:user_id, :event, :element_in, :element_in_cost, :element_out, :element_out_cost, :time)
+        ON CONFLICT(user_id, element_in, element_out, time) DO UPDATE SET
             event = excluded.event,
             element_in_cost = excluded.element_in_cost,
             element_out_cost = excluded.element_out_cost
         """,
-        rows,
+        payload,
     )
     conn.commit()
 
 
-def get_squad_transfers_in(conn: sqlite3.Connection, player_id: int) -> list[sqlite3.Row]:
-    """Every transfer that brought `player_id` into the squad, most recent first — used to
-    resolve their purchase price (the most recent element_in_cost, since a player sold and
-    re-bought later has a new purchase price)."""
+def get_squad_transfers_in(conn: sqlite3.Connection, user_id: int, player_id: int) -> list[sqlite3.Row]:
+    """Every transfer that brought `player_id` into `user_id`'s squad, most recent first —
+    used to resolve their purchase price (the most recent element_in_cost, since a player
+    sold and re-bought later has a new purchase price)."""
     cursor = conn.execute(
-        "SELECT * FROM squad_transfers WHERE element_in = ? ORDER BY time DESC", (player_id,)
+        "SELECT * FROM squad_transfers WHERE user_id = ? AND element_in = ? ORDER BY time DESC",
+        (user_id, player_id),
     )
     return cursor.fetchall()
 
@@ -518,18 +580,21 @@ def get_earliest_own_snapshot_price(conn: sqlite3.Connection, player_id: int) ->
     return row["now_cost"] if row else None
 
 
-def insert_owned_squad(conn: sqlite3.Connection, rows: list[dict], season: str, gameweek: int, recorded_at: str) -> None:
+def insert_owned_squad(
+    conn: sqlite3.Connection, rows: list[dict], user_id: int, season: str, gameweek: int, recorded_at: str
+) -> None:
     """rows: {player_id, is_starting, is_captain, is_vice_captain, purchase_price}. One
-    snapshot per (season, gameweek) — re-running `squad` for the same locked gameweek
-    updates in place rather than duplicating."""
+    snapshot per (user_id, season, gameweek) — re-running `squad` for the same locked
+    gameweek updates in place rather than duplicating."""
     payload = [
-        {**row, "season": season, "gameweek": gameweek, "recorded_at": recorded_at} for row in rows
+        {**row, "user_id": user_id, "season": season, "gameweek": gameweek, "recorded_at": recorded_at}
+        for row in rows
     ]
     conn.executemany(
         """
-        INSERT INTO owned_squad (season, gameweek, player_id, is_starting, is_captain, is_vice_captain, purchase_price, recorded_at)
-        VALUES (:season, :gameweek, :player_id, :is_starting, :is_captain, :is_vice_captain, :purchase_price, :recorded_at)
-        ON CONFLICT(season, gameweek, player_id) DO UPDATE SET
+        INSERT INTO owned_squad (user_id, season, gameweek, player_id, is_starting, is_captain, is_vice_captain, purchase_price, recorded_at)
+        VALUES (:user_id, :season, :gameweek, :player_id, :is_starting, :is_captain, :is_vice_captain, :purchase_price, :recorded_at)
+        ON CONFLICT(user_id, season, gameweek, player_id) DO UPDATE SET
             is_starting = excluded.is_starting,
             is_captain = excluded.is_captain,
             is_vice_captain = excluded.is_vice_captain,
@@ -541,33 +606,80 @@ def insert_owned_squad(conn: sqlite3.Connection, rows: list[dict], season: str, 
     conn.commit()
 
 
-def get_owned_squad(conn: sqlite3.Connection, season: str, gameweek: int) -> list[sqlite3.Row]:
+def get_owned_squad(conn: sqlite3.Connection, user_id: int, season: str, gameweek: int) -> list[sqlite3.Row]:
     cursor = conn.execute(
-        "SELECT * FROM owned_squad WHERE season = ? AND gameweek = ?", (season, gameweek)
+        "SELECT * FROM owned_squad WHERE user_id = ? AND season = ? AND gameweek = ?",
+        (user_id, season, gameweek),
     )
     return cursor.fetchall()
 
 
 def insert_team_state(
-    conn: sqlite3.Connection, season: str, gameweek: int, bank: int | None,
+    conn: sqlite3.Connection, user_id: int, season: str, gameweek: int, bank: int | None,
     free_transfers: int, chips_available: list[str], recorded_at: str,
 ) -> None:
     conn.execute(
         """
-        INSERT INTO team_state (season, gameweek, bank, free_transfers, chips_available, recorded_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(season, gameweek) DO UPDATE SET
+        INSERT INTO team_state (user_id, season, gameweek, bank, free_transfers, chips_available, recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, season, gameweek) DO UPDATE SET
             bank = excluded.bank,
             free_transfers = excluded.free_transfers,
             chips_available = excluded.chips_available,
             recorded_at = excluded.recorded_at
         """,
-        (season, gameweek, bank, free_transfers, json.dumps(chips_available), recorded_at),
+        (user_id, season, gameweek, bank, free_transfers, json.dumps(chips_available), recorded_at),
     )
     conn.commit()
 
 
-def get_team_state(conn: sqlite3.Connection, season: str, gameweek: int) -> sqlite3.Row | None:
+def get_team_state(conn: sqlite3.Connection, user_id: int, season: str, gameweek: int) -> sqlite3.Row | None:
     return conn.execute(
-        "SELECT * FROM team_state WHERE season = ? AND gameweek = ?", (season, gameweek)
+        "SELECT * FROM team_state WHERE user_id = ? AND season = ? AND gameweek = ?",
+        (user_id, season, gameweek),
     ).fetchone()
+
+
+# --- Accounts (M8) ---------------------------------------------------------------------
+
+def create_user(conn: sqlite3.Connection, email: str, password_hash: str, created_at: str) -> int:
+    cursor = conn.execute(
+        "INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)",
+        (email.strip().lower(), password_hash, created_at),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_user_by_email(conn: sqlite3.Connection, email: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM users WHERE email = ?", (email.strip().lower(),)).fetchone()
+
+
+def get_user_by_id(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def update_user_fpl_team_id(conn: sqlite3.Connection, user_id: int, fpl_team_id: int) -> None:
+    conn.execute("UPDATE users SET fpl_team_id = ? WHERE id = ?", (fpl_team_id, user_id))
+    conn.commit()
+
+
+# --- Reference data reads (players/teams) -----------------------------------------------
+
+def get_players(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """All known players with their current team/position — backs a player-list endpoint.
+    Not season-scoped: `players` itself isn't (schema.sql), unlike player_gw_stats."""
+    return conn.execute(
+        """
+        SELECT p.id, p.web_name, p.first_name, p.second_name, p.team_id, p.element_type,
+               t.short_name AS team_short_name, et.singular_name_short AS position
+        FROM players p
+        JOIN teams t ON t.id = p.team_id
+        JOIN element_types et ON et.id = p.element_type
+        ORDER BY p.web_name
+        """
+    ).fetchall()
+
+
+def get_teams(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM teams ORDER BY name").fetchall()

@@ -82,16 +82,22 @@ def conn():
     connection.close()
 
 
+def _seed_user(conn) -> int:
+    return db.create_user(conn, email="u@example.com", password_hash="x", created_at="2025-08-01T00:00:00Z")
+
+
 def test_resolve_purchase_price_uses_most_recent_transfer_in(conn):
+    user_id = _seed_user(conn)
     db.insert_squad_transfers(conn, [
         {"event": 3, "element_in": 123, "element_in_cost": 80, "element_out": 456, "element_out_cost": 55, "time": "2025-09-01T18:00:00Z"},
         {"event": 8, "element_in": 123, "element_in_cost": 95, "element_out": 456, "element_out_cost": 55, "time": "2025-10-15T18:00:00Z"},
-    ])
+    ], user_id=user_id)
     # Sold and re-bought later at a different price -> the later purchase is what counts.
-    assert squad_state.resolve_purchase_price(conn, player_id=123, season="2025-26") == 95
+    assert squad_state.resolve_purchase_price(conn, user_id=user_id, player_id=123, season="2025-26") == 95
 
 
 def test_resolve_purchase_price_falls_back_to_earliest_own_snapshot_for_opening_15(conn):
+    user_id = _seed_user(conn)
     db.insert_player_snapshots(conn, [
         {"code": 123, "now_cost": 75, "selected_by_percent": "10.0", "status": "a",
          "chance_of_playing_this_round": None, "chance_of_playing_next_round": None, "news": ""},
@@ -101,11 +107,12 @@ def test_resolve_purchase_price_falls_back_to_earliest_own_snapshot_for_opening_
          "chance_of_playing_this_round": None, "chance_of_playing_next_round": None, "news": ""},
     ], snapshot_date="2025-09-01", fetched_at="2025-09-01T00:00:00Z")
     # Never transferred in -> earliest snapshot (75), not the later one (82).
-    assert squad_state.resolve_purchase_price(conn, player_id=123, season="2025-26") == 75
+    assert squad_state.resolve_purchase_price(conn, user_id=user_id, player_id=123, season="2025-26") == 75
 
 
 def test_resolve_purchase_price_none_when_neither_source_has_data(conn):
-    assert squad_state.resolve_purchase_price(conn, player_id=999, season="2025-26") is None
+    user_id = _seed_user(conn)
+    assert squad_state.resolve_purchase_price(conn, user_id=user_id, player_id=999, season="2025-26") is None
 
 
 def _synthetic_pool(n_per_position=10, n_teams=6) -> pd.DataFrame:
