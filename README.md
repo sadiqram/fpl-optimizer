@@ -100,6 +100,11 @@ Then set `FPL_ADMIN_EMAIL` in `.env` to that email — the CLI resolves which ac
 as from that (`squad`/`recommend`/`plan` all need one now); the web app resolves it from a
 JWT instead.
 
+Also set `ADMIN_EMAILS` (comma-separated) to the account(s) allowed to call `POST /train`:
+that endpoint retrains and can overwrite the single shared model artifact every tenant's
+`/recommendations` and `/plans` load, so it's gated to an allowlist rather than any
+authenticated account.
+
 **Run locally:**
 
 ```bash

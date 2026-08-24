@@ -245,6 +245,29 @@ def test_accuracy_log_is_a_list(client: TestClient):
     assert isinstance(r.json(), list)
 
 
+# --- train ------------------------------------------------------------------------------
+
+def test_train_rejects_non_admin(client: TestClient, monkeypatch):
+    monkeypatch.setenv("ADMIN_EMAILS", "admin@example.com")
+    headers = _auth_headers(client, email="a@example.com")
+    r = client.post(
+        "/train", headers=headers,
+        json={"season": "2025-26", "train_start": 1, "train_end": 1, "test_start": 2, "test_end": 2, "save": False},
+    )
+    assert r.status_code == 403
+
+
+def test_train_allows_admin(client: TestClient, monkeypatch):
+    monkeypatch.setenv("ADMIN_EMAILS", "admin@example.com")
+    headers = _auth_headers(client, email="admin@example.com")
+    r = client.post(
+        "/train", headers=headers,
+        json={"season": "2025-26", "train_start": 1, "train_end": 1, "test_start": 2, "test_end": 2, "save": False},
+    )
+    assert r.status_code == 200, r.text
+    assert "mae_by_model" in r.json()
+
+
 # --- backtest ---------------------------------------------------------------------------
 
 def test_backtest_smoke(client: TestClient):

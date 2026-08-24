@@ -5,7 +5,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from fpl_optimizer.api import schemas
-from fpl_optimizer.api.deps import get_conn, get_current_user
+from fpl_optimizer.api.deps import get_conn, require_admin
 from fpl_optimizer.services import train_service
 
 router = APIRouter(prefix="/train", tags=["train"])
@@ -14,7 +14,7 @@ router = APIRouter(prefix="/train", tags=["train"])
 @router.post("")
 def train(
     body: schemas.TrainRequest,
-    _user: sqlite3.Row = Depends(get_current_user),  # global model artifact, not per-tenant
+    _user: sqlite3.Row = Depends(require_admin),  # global model artifact, not per-tenant — admin-only
     conn: sqlite3.Connection = Depends(get_conn),
 ):
     try:

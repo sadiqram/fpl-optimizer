@@ -53,3 +53,15 @@ def require_fpl_team_id(user: sqlite3.Row = Depends(get_current_user)) -> int:
     if user["fpl_team_id"] is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No FPL team connected — set one in Settings first.")
     return user["fpl_team_id"]
+
+
+def require_admin(user: sqlite3.Row = Depends(get_current_user)) -> sqlite3.Row:
+    """Gates operator-only endpoints (e.g. /train, which overwrites the single shared model
+    artifact every tenant's /recommendations and /plans load) behind an email allowlist —
+    mirrors the CLI's FPL_ADMIN_EMAIL account-resolution pattern (cli.py), but as an
+    authorization check rather than an identity one, since the web app already knows who's
+    calling from the JWT."""
+    admin_emails = {e.strip() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+    if user["email"] not in admin_emails:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin access required")
+    return user
