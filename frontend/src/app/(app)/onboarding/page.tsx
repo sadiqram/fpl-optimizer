@@ -20,7 +20,7 @@ export default function OnboardingPage() {
       <form action={formAction} className="card p-6 space-y-4">
         <div>
           <label className="label" htmlFor="fpl_team_id">FPL team ID</label>
-          <input className="input" id="fpl_team_id" name="fpl_team_id" type="number" required autoFocus placeholder="2786467" />
+          <input className="input" id="fpl_team_id" name="fpl_team_id" type="number" required autoFocus placeholder="1234567" />
         </div>
         {state.error && <p className="text-sm text-danger">{state.error}</p>}
         <button className="btn btn-primary" type="submit" disabled={pending}>
