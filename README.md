@@ -121,13 +121,16 @@ npm run dev
 Open `http://localhost:3000`, register an account, connect an FPL team ID (Settings), then
 sync your squad.
 
-**Deploy:** `Dockerfile` + `fly.toml` build the backend for Fly.io (comments in `fly.toml`
-have the exact commands — volume for the SQLite file, secrets for `JWT_SECRET`/`FPL_TEAM_ID`/
-`CORS_ORIGIN`); the frontend deploys to Vercel with `BACKEND_URL` pointed at the deployed
-backend. Neither config has been run against a real Fly.io/Vercel account yet — verify
-`fly config validate` and a real `fly deploy` before trusting it in production. The backend
-runs one machine always-on (not scale-to-zero) so `api/scheduler.py`'s daily refresh — the
-actual fix for the WSL-cron problem that started this — can't be silently skipped.
+**Deploy:** `Dockerfile` + `fly.toml` build the backend for Fly.io, already launched as
+`fpl-optimizer-api` in `iad`; `.github/workflows/fly-deploy.yml` redeploys it on every push to
+`main` via `flyctl deploy --remote-only`, gated on the `FLY_API_TOKEN` repo secret. One-time
+setup for a fresh app: `fly volumes create fpl_data --size 1 --region iad`, then
+`fly secrets set JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")`
+and `fly secrets set FPL_TEAM_ID=<your team id> CORS_ORIGIN=https://<your-vercel-domain>`. The
+frontend deploys to Vercel with `BACKEND_URL` pointed at the deployed backend — that side
+hasn't been run against a real Vercel account yet. The backend runs one machine always-on
+(not scale-to-zero) so `api/scheduler.py`'s daily refresh — the actual fix for the WSL-cron
+problem that started this — can't be silently skipped.
 
 ## Tests
 
