@@ -92,12 +92,20 @@ fpl-optimizer/
 │   │   ├── horizon.py      # multi-GW rolling optimization
 │   │   ├── transfers.py    # hit thresholds, FT banking
 │   │   ├── chips.py        # chip timing scenarios
-│   │   └── risk.py         # risk parameter writers (manual in v1) + presets
+│   │   ├── risk.py         # risk parameter writers (manual in v1) + presets
+│   │   └── squad_state.py  # purchase price, FT banking, chip availability
 │   ├── evaluation/
 │   │   ├── backtest.py
-│   │   └── metrics.py
-│   ├── cli.py
-│   └── clock.py            # "what time is it" — the injection point for P2
+│   │   ├── metrics.py
+│   │   └── accuracy_log.py # the running MAE/RMSE CSV — read by CLI `evaluate` and API alike
+│   ├── services/            # (M8) CLI/API-shared business logic — one implementation, two front doors
+│   │   ├── ingest_service.py, squad_service.py, recommend_service.py, plan_service.py
+│   │   └── train_service.py, backtest_service.py, evaluate_service.py, predictor_service.py
+│   ├── api/                 # (M8) FastAPI app — primary interface for live/deployed use
+│   │   ├── main.py, auth.py, deps.py, schemas.py, scheduler.py
+│   │   └── routers/         # one module per services/ counterpart
+│   ├── cli.py                # local/dev/backtest entry point — thin wrapper over services/
+│   └── clock.py              # "what time is it" — the injection point for P2
 ├── config/
 │   ├── default.yaml
 │   └── models/*.yaml
@@ -105,12 +113,16 @@ fpl-optimizer/
 │   ├── raw/                # immutable snapshots
 │   ├── db/fpl.sqlite
 │   └── artifacts/          # predictions, recommendations, logs
+├── frontend/                # (M8) Next.js app, deployed separately (Vercel)
+│   └── src/{app,lib,components}/
 ├── notebooks/              # exploration only, never imported by src/
 ├── tests/
 ├── scripts/
-│   └── daily_ingest.sh     # cron entry calling `fpl-optimizer ingest` (§5: no orchestration framework)
+│   ├── daily_ingest.sh              # cron entry calling `fpl-optimizer ingest` — local/dev only; api/scheduler.py is the deployed equivalent
+│   └── migrate_to_multitenant.py    # (M8) one-off: adds users/plan_runs, threads user_id through the owned-squad tables
 ├── docs/
 │   └── error_log.md        # real bugs found + fixes, chronological — not a design doc
+├── Dockerfile, fly.toml      # (M8) backend deploy — see README's "Web app" section
 ├── .env.example            # FPL_TEAM_ID etc. — real .env gitignored
 └── ARCHITECTURE.md
 ```
@@ -276,7 +288,8 @@ Each run solves for the whole horizon but only *commits* the current gameweek's 
 
 ### 4.7 Interface
 
-**Choice: CLI, outputting a human-readable summary plus a persisted JSON artifact.**
+**Original choice (M0-M6): CLI, outputting a human-readable summary plus a persisted JSON
+artifact** — reasoning below, and it's the reason M8 could be added without a rewrite.
 
 ```bash
 fpl-optimizer recommend --gameweek 12
@@ -287,6 +300,57 @@ fpl-optimizer evaluate --gameweek 11
 **Justification:** the deliverable is one decision per week that a human reads and acts on. A web UI is substantial work that adds no decision quality. The JSON artifact means a UI can be added later without touching any logic — the recommendation is already a data structure, not print statements.
 
 **Output must include rationale, not just conclusions:** which players changed, expected point delta, whether a hit clears its threshold, and the key features driving each prediction. Per NFR3, an unexplained recommendation can't be meaningfully approved — the human's job in the loop is to catch what the model can't see (a press-conference comment, a suspension), and they can only do that if they can see the model's reasoning.
+
+**Revised (M8): a FastAPI + Next.js web app becomes the primary interface for live use; the
+CLI stays the local/dev/backtest entry point.** Two things changed the original calculus.
+First, the daily-ingest cron job (`scripts/daily_ingest.sh`) turned out to depend on the WSL
+VM happening to be running at 6am — it isn't, unless something else is keeping it alive, so
+the job silently stopped firing for two weeks with no error anywhere. An always-on deployed
+backend sidesteps that failure mode instead of fighting it (`api/scheduler.py`'s
+`BackgroundScheduler`, §5's "no orchestration framework" still holds — this is one more job,
+not a fleet). Second, the project is opening up beyond a single user: each account now
+connects its own FPL team, reversing PRD §3's original "not a multi-user product" non-goal.
+
+**This did not become a rewrite, because of a decision already in place:** every `cli._cmd_*`
+function's actual logic — never its `print`s — has been extracted into
+`src/fpl_optimizer/services/*.py` (`recommend_service.run_recommend`, `plan_service.run_plan`,
+etc.). `cli.py`'s commands now call these and print the result; `api/routers/*.py` calls the
+exact same functions and returns the result as JSON. Neither front end reimplements anything
+— this is Architecture P2's one-code-path principle applied to the interface layer, not just
+the backtest/live split it was originally written for.
+
+**Multi-tenancy is scoped narrowly.** Only the owned-squad layer needed a tenant key:
+`users`, plus `user_id` threaded through `owned_squad`, `team_state`, `squad_transfers`,
+`recommendations`, and the new `plan_runs` table (`plan` was never persisted before M8 — a
+gap this closed in passing). Shared FPL-wide facts — players, teams, fixtures, predictions,
+model artifacts — stay global; every account's squad picks from the same prediction pool.
+`squad_service.sync_squad`/`recommend_service.run_recommend`/`plan_service.run_plan` take an
+explicit `user_id` (and, for squad, a `team_id`) instead of reading `FPL_TEAM_ID` from the
+environment; the CLI resolves a single local admin account via `FPL_ADMIN_EMAIL` (seeded by
+`scripts/migrate_to_multitenant.py`), the API resolves the account from a JWT
+(`api/deps.py::get_current_user`).
+
+**Auth is a JWT issued by the backend** (`api/auth.py` — bcrypt password hashing, `python-jose`
+for signing), not a session framework on either side. The frontend never touches the JWT in
+client JS: a Server Function calls `/auth/login`, gets the token, and sets it as an httpOnly
+cookie (`frontend/src/lib/session.ts`); every subsequent page/action is a Next.js Server
+Component or Server Function that reads that cookie and forwards the token to the backend.
+The browser only ever talks to the Next.js server, never directly to FastAPI.
+
+**Deployment topology:** Next.js on Vercel, FastAPI on Fly.io with SQLite unchanged on a
+persistent volume (no Postgres migration — Architecture §4.2's "SQLite is enough at this
+scale" reasoning still applies; the constraint was never SQLite itself, only that most PaaS
+filesystems don't survive a redeploy). The backend runs one always-on machine rather than the
+usual scale-to-zero default, since scaling to zero would reintroduce exactly the "nothing
+wakes it up for the daily job" failure this was built to fix.
+
+**A known rough edge:** FastAPI dispatches each sync dependency and route body via anyio's
+threadpool independently, so a `sqlite3.Connection` opened for one request can be used by a
+different OS thread than the one that later reads from it within that same request —
+`sqlite3`'s default same-thread check raises on this even though usage is still sequential,
+never concurrent. Fixed by `check_same_thread=False` in `storage/db.py::connect` (a no-op for
+the CLI and tests, which are single-threaded) — found by actually running the app end-to-end
+against the real backend, not by unit tests, which don't exercise FastAPI's thread dispatch.
 
 ---
 

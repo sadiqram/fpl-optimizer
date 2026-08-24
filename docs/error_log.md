@@ -339,3 +339,31 @@ PRD's own §11 already named as a risk of building this early.
 explicitly), not simply next in the queue. Revisit once the live season has started and a
 real mini-league's standings have actually been snapshotted for a few gameweeks; there's
 nothing to build correctly before then.
+
+---
+
+## 18. `sqlite3.ProgrammingError` under FastAPI — connections aren't thread-affine the way the CLI assumed
+
+**When:** M8, running the web app end-to-end for the first time — `GET /dashboard` (which
+calls `GET /recommendations` and `GET /plans`) against a real logged-in session.
+**Found by:** Running it — driving the actual Next.js dev server against the actual FastAPI
+backend with real HTTP requests (Server Actions' no-JS multipart-POST protocol, curl-driven,
+since no headless browser was available in this environment), not by any unit test. The
+existing test suite's `TestClient` calls didn't catch this because Starlette's `TestClient`
+dispatches synchronously by default in a way that happened not to trigger the same
+cross-thread access.
+**What happened:** `storage/db.py::connect` had always opened `sqlite3.connect(db_path)` with
+default settings, fine for the CLI and every test (both strictly single-threaded per
+connection). FastAPI's sync (`def`, not `async def`) routes and `yield`-based dependencies
+each get dispatched via `anyio.to_thread.run_sync` independently — so `api/deps.py::get_conn`
+can open a connection on one worker thread while the route body that consumes it (also
+offloaded to the threadpool) runs on a different one. `sqlite3.Connection` defaults to
+`check_same_thread=True`, which raises the moment that happens, even though actual usage
+within one request is still strictly sequential — dependency yields the connection, then the
+route uses it, never concurrently.
+**Fix:** Added `check_same_thread=False` to the `sqlite3.connect(...)` call in
+`storage/db.py::connect`. A no-op for the CLI and test suite (still single-threaded, still
+never shares a connection across real concurrent access) and the correct fix for the API's
+actual access pattern. General lesson repeated from entries above: this class of bug is
+invisible to both code review and the unit-test suite, and only surfaces by actually running
+the real server process and driving it with real requests.

@@ -7,6 +7,14 @@ import requests
 BASE_URL = "https://fantasy.premierleague.com/api"
 
 
+def infer_current_season(bootstrap: dict) -> str:
+    """FPL runs Aug-May; derive '2026-27' from GW1's deadline year rather than wall-clock
+    time, since that's a property of the data, not of when ingest happens to run."""
+    gw1_deadline = bootstrap["events"][0]["deadline_time"]
+    start_year = int(gw1_deadline[:4])
+    return f"{start_year}-{str(start_year + 1)[2:]}"
+
+
 class FPLClient:
     def __init__(self, session: requests.Session | None = None, timeout: float = 15.0):
         self._session = session or requests.Session()
