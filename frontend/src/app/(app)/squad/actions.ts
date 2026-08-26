@@ -35,10 +35,19 @@ export async function syncSquadAction(_prev: SyncState, formData: FormData): Pro
       token,
     });
     const gameweek = Number(summary.gameweek);
-    const detail = await apiFetch<{ owned_squad: SquadPlayer[] }>(`/squad/${season}/${gameweek}`, { token });
     revalidatePath("/squad");
     revalidatePath("/dashboard");
-    return { error: null, summary, squad: detail.owned_squad };
+    let squad: SquadPlayer[] | null = null;
+    try {
+      const detail = await apiFetch<{ owned_squad: SquadPlayer[] }>(
+        `/squad/${encodeURIComponent(season)}/${gameweek}`,
+        { token },
+      );
+      squad = detail.owned_squad;
+    } catch {
+      squad = null;
+    }
+    return { error: null, summary, squad };
   } catch (err) {
     if (err instanceof ApiError) return { error: err.message, summary: null, squad: null };
     return { error: "Could not reach the server. Try again.", summary: null, squad: null };
