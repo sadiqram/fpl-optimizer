@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useState } from "react";
+import { useActionState, useEffect, useRef, useState } from "react";
 import { PlayerList } from "@/components/PlayerList";
 import { createPlanAction, type PlanState } from "./actions";
 
@@ -17,6 +17,19 @@ export default function PlanPage() {
   const [gameweek, setGameweek] = useState("1");
   const [model, setModel] = useState("poisson");
   const [preset, setPreset] = useState("balanced");
+
+  // React 19's form-action reset restores controlled <input>s but not <select>s (the browser's
+  // native post-submit form.reset() clobbers the <select> DOM node and React never re-syncs it).
+  // Force a remount with the current value once the action settles.
+  const [selectKey, setSelectKey] = useState(0);
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    setSelectKey((k) => k + 1);
+  }, [state]);
 
   return (
     <div className="max-w-2xl">
@@ -43,13 +56,13 @@ export default function PlanPage() {
         </div>
         <div>
           <label className="label" htmlFor="model">Model</label>
-          <select className="input" id="model" name="model" value={model} onChange={(e) => setModel(e.target.value)}>
+          <select key={selectKey} className="input" id="model" name="model" value={model} onChange={(e) => setModel(e.target.value)}>
             {MODELS.map((m) => <option key={m} value={m}>{m}</option>)}
           </select>
         </div>
         <div>
           <label className="label" htmlFor="preset">Preset</label>
-          <select className="input" id="preset" name="preset" value={preset} onChange={(e) => setPreset(e.target.value)}>
+          <select key={selectKey} className="input" id="preset" name="preset" value={preset} onChange={(e) => setPreset(e.target.value)}>
             {PRESETS.map((p) => <option key={p} value={p}>{p.replace("_", "-")}</option>)}
           </select>
         </div>

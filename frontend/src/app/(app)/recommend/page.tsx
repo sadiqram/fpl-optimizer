@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useState } from "react";
+import { useActionState, useEffect, useRef, useState } from "react";
 import { PlayerList } from "@/components/PlayerList";
 import { createRecommendationAction, type RecommendState } from "./actions";
 
@@ -12,6 +12,19 @@ export default function RecommendPage() {
   const [season, setSeason] = useState("2026-27");
   const [gameweek, setGameweek] = useState("1");
   const [model, setModel] = useState("poisson");
+
+  // React 19's form-action reset restores controlled <input>s but not <select>s (the browser's
+  // native post-submit form.reset() clobbers the <select> DOM node and React never re-syncs it).
+  // Force a remount with the current value once the action settles.
+  const [selectKey, setSelectKey] = useState(0);
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    setSelectKey((k) => k + 1);
+  }, [state]);
 
   return (
     <div className="max-w-2xl">
@@ -38,7 +51,7 @@ export default function RecommendPage() {
         </div>
         <div>
           <label className="label" htmlFor="model">Model</label>
-          <select className="input" id="model" name="model" value={model} onChange={(e) => setModel(e.target.value)}>
+          <select key={selectKey} className="input" id="model" name="model" value={model} onChange={(e) => setModel(e.target.value)}>
             {MODELS.map((m) => <option key={m} value={m}>{m}</option>)}
           </select>
         </div>

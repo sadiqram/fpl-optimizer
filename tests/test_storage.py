@@ -166,6 +166,61 @@ def test_user_crud(conn):
     assert db.get_user_by_id(conn, user_id)["fpl_team_id"] == 2786467
 
 
+def test_get_owned_squad_detailed_joins_identity_and_latest_price(conn):
+    """Regression guard for the squad page: it renders names/clubs/values from this join,
+    not just the sync summary counts, so the join must actually resolve them."""
+    db.upsert_teams(conn, [
+        {"id": 1, "name": "Arsenal", "short_name": "ARS"},
+        {"id": 2, "name": "Liverpool", "short_name": "LIV"},
+    ])
+    db.upsert_element_types(conn, [
+        {"id": 1, "singular_name_short": "GKP", "singular_name": "Goalkeeper"},
+        {"id": 3, "singular_name_short": "MID", "singular_name": "Midfielder"},
+    ])
+    db.upsert_players(conn, [
+        {"id": 1, "code": 1, "first_name": "Bukayo", "second_name": "Saka", "web_name": "Saka", "team": 1, "element_type": 3},
+        {"id": 2, "code": 2, "first_name": "Alisson", "second_name": "Becker", "web_name": "Alisson", "team": 2, "element_type": 1},
+    ], updated_at="2026-08-01T00:00:00Z")
+    db.insert_player_snapshots(
+        conn,
+        [{"code": 1, "now_cost": 100, "selected_by_percent": None, "status": "a",
+          "chance_of_playing_this_round": None, "chance_of_playing_next_round": None, "news": ""}],
+        snapshot_date="2026-08-01", fetched_at="2026-08-01T00:00:00Z",
+    )
+    db.insert_player_snapshots(
+        conn,
+        [{"code": 1, "now_cost": 105, "selected_by_percent": None, "status": "a",
+          "chance_of_playing_this_round": None, "chance_of_playing_next_round": None, "news": ""}],
+        snapshot_date="2026-08-10", fetched_at="2026-08-10T00:00:00Z",
+    )
+    user_id = db.create_user(conn, email="squad@example.com", password_hash="x", created_at="2026-08-01T00:00:00Z")
+    db.insert_owned_squad(
+        conn,
+        [
+            {"player_id": 1, "is_starting": 1, "is_captain": 1, "is_vice_captain": 0, "purchase_price": 95},
+            {"player_id": 2, "is_starting": 0, "is_captain": 0, "is_vice_captain": 0, "purchase_price": 55},
+        ],
+        user_id=user_id, season="2026-27", gameweek=1, recorded_at="2026-08-11T00:00:00Z",
+    )
+
+    rows = db.get_owned_squad_detailed(conn, user_id, "2026-27", 1)
+    assert [r["player_id"] for r in rows] == [1, 2]  # starting first, then bench
+
+    saka = rows[0]
+    assert saka["web_name"] == "Saka"
+    assert saka["position"] == "MID"
+    assert saka["team_short_name"] == "ARS"
+    assert saka["team_name"] == "Arsenal"
+    assert saka["is_captain"] == 1
+    assert saka["current_price"] == 105  # most recent snapshot, not the first one
+
+    alisson = rows[1]
+    assert alisson["web_name"] == "Alisson"
+    assert alisson["position"] == "GKP"
+    assert alisson["team_short_name"] == "LIV"
+    assert alisson["current_price"] is None  # no snapshot for this player -> falls back client-side
+
+
 def test_insert_event_live_stats_maps_element_id_and_skips_unmapped(conn):
     _seed_one_player(conn)  # players.id (code) = 123, element_id = 1 (the "id" field passed to upsert_players)
     elements = [
