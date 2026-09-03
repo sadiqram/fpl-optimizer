@@ -1,0 +1,24 @@
+# Redeploys the backend on push to main (Architecture §4.7). The VM already has the repo
+# cloned and `.env` populated (README "One-time VM setup") — this just pulls + rebuilds.
+name: GCP Deploy
+on:
+  push:
+    branches:
+      - main
+      - master
+jobs:
+  deploy:
+    name: Deploy to GCP VM
+    runs-on: ubuntu-latest
+    concurrency: deploy-group
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.GCP_VM_HOST }}
+          username: ${{ secrets.GCP_VM_USER }}
+          key: ${{ secrets.GCP_VM_SSH_KEY }}
+          script: |
+            cd /opt/fpl-optimizer
+            git pull origin main
+            docker compose up -d --build

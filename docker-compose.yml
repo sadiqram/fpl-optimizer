@@ -1,0 +1,33 @@
+# Runs the backend on the GCP e2-micro VM (Architecture §4.7). `api` is the FastAPI app
+# from Dockerfile; `caddy` is only here for automatic TLS in front of it (its DOMAIN env
+# var must point at a DNS A record aimed at the VM's static IP before first start).
+services:
+  api:
+    build: .
+    restart: always
+    env_file: .env
+    environment:
+      DB_PATH: /app/data/db/fpl.sqlite
+    volumes:
+      - ./data:/app/data
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: always
+    depends_on:
+      - api
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

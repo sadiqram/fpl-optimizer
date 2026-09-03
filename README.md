@@ -86,17 +86,43 @@ npm run dev
 
 Open `http://localhost:3000`, register an account, connect an FPL team ID (Settings), then sync your squad.
 
-**Deploy:** `Dockerfile` + `fly.toml` build the backend for Fly.io, already launched as `fpl-optimizer-api` in `iad`; `.github/workflows/fly-deploy.yml` redeploys it on every push to `main` via `flyctl deploy --remote-only`, gated on the `FLY_API_TOKEN` repo secret.
+**Deploy:** the backend runs on a GCP `e2-micro` VM (Always Free tier — genuinely free, not a trial, unlike Fly.io/Render's free tiers) via `docker-compose.yml` (the app container + Caddy for automatic TLS). `.github/workflows/gcp-deploy.yml` redeploys it on every push to `main` by SSHing in and running `docker compose up -d --build`, gated on the `GCP_VM_HOST`/`GCP_VM_USER`/`GCP_VM_SSH_KEY` repo secrets. It's a long-lived container (`restart: always`), not scale-to-zero, so `api/scheduler.py`'s daily refresh doesn't get silently skipped.
 
-One-time setup for a fresh app:
+**One-time VM setup:**
 
 ```bash
-fly volumes create fpl_data --size 1 --region iad
-fly secrets set JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-fly secrets set FPL_TEAM_ID=<your team id> CORS_ORIGIN=https://<your-vercel-domain>
+# create the VM — us-west1/us-central1/us-east1 for Always Free eligibility
+gcloud compute instances create fpl-optimizer \
+  --zone=us-west1-b --machine-type=e2-micro \
+  --image-family=debian-12 --image-project=debian-cloud \
+  --boot-disk-size=30GB --tags=http-server,https-server
+
+gcloud compute firewall-rules create allow-http-https \
+  --allow=tcp:80,tcp:443 --target-tags=http-server,https-server
+
+# reserve a static IP so it survives VM restarts (Caddy's cert depends on stable DNS)
+gcloud compute addresses create fpl-optimizer-ip --region=us-west1
 ```
 
-The backend runs one machine always-on (not scale-to-zero) so `api/scheduler.py`'s daily refresh doesn't get silently skipped. The frontend deploys to Vercel with `BACKEND_URL` pointed at the deployed backend — that side hasn't been run against a real Vercel account yet.
+Point a DNS A record for your API domain at that static IP, then on the VM:
+
+```bash
+ssh <user>@<vm-ip>
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER   # log out/in to pick this up
+git clone <repo-url> /opt/fpl-optimizer && cd /opt/fpl-optimizer
+
+cp .env.example .env
+echo "JWT_SECRET=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" >> .env
+echo "FPL_TEAM_ID=<your team id>" >> .env
+echo "ADMIN_EMAILS=<you@example.com>" >> .env
+echo "CORS_ORIGIN=https://<your-vercel-domain>" >> .env
+echo "DOMAIN=<your-api-domain>" >> .env
+
+docker compose up -d --build
+```
+
+The frontend deploys to Vercel with `BACKEND_URL` pointed at `https://<DOMAIN>` — that side hasn't been run against a real Vercel account yet.
 
 ## Tests
 
