@@ -614,6 +614,37 @@ def get_owned_squad(conn: sqlite3.Connection, user_id: int, season: str, gamewee
     return cursor.fetchall()
 
 
+def get_owned_squad_detailed(conn: sqlite3.Connection, user_id: int, season: str, gameweek: int) -> list[sqlite3.Row]:
+    """Owned squad joined with player identity (name/club/position) and each player's most
+    recently known price, for display purposes — not leakage-sensitive (this is UI, not a
+    training feature), so it just takes the latest snapshot rather than an as-of cutoff."""
+    return conn.execute(
+        """
+        SELECT
+            os.player_id, os.is_starting, os.is_captain, os.is_vice_captain, os.purchase_price,
+            p.web_name, p.element_type, et.singular_name_short AS position,
+            t.short_name AS team_short_name, t.name AS team_name,
+            latest.now_cost AS current_price
+        FROM owned_squad os
+        JOIN players p ON p.id = os.player_id
+        JOIN teams t ON t.id = p.team_id
+        JOIN element_types et ON et.id = p.element_type
+        LEFT JOIN (
+            SELECT ps.player_id, ps.now_cost
+            FROM player_snapshots ps
+            JOIN (
+                SELECT player_id, MAX(snapshot_date) AS max_date
+                FROM player_snapshots
+                GROUP BY player_id
+            ) m ON m.player_id = ps.player_id AND m.max_date = ps.snapshot_date
+        ) latest ON latest.player_id = os.player_id
+        WHERE os.user_id = ? AND os.season = ? AND os.gameweek = ?
+        ORDER BY os.is_starting DESC, os.player_id
+        """,
+        (user_id, season, gameweek),
+    ).fetchall()
+
+
 def insert_team_state(
     conn: sqlite3.Connection, user_id: int, season: str, gameweek: int, bank: int | None,
     free_transfers: int, chips_available: list[str], recorded_at: str,

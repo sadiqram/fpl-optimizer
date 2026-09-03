@@ -31,6 +31,6 @@ def get_squad(
     user: sqlite3.Row = Depends(get_current_user),
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    owned = [dict(r) for r in db.get_owned_squad(conn, user["id"], season, gameweek)]
+    owned = [dict(r) for r in db.get_owned_squad_detailed(conn, user["id"], season, gameweek)]
     team_state = db.get_team_state(conn, user["id"], season, gameweek + 1)
     return {"owned_squad": owned, "team_state": dict(team_state) if team_state else None}

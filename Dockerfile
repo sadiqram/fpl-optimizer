@@ -1,5 +1,5 @@
 # Backend only (FastAPI + uvicorn). The frontend deploys separately to Vercel
-# (Architecture §4.7/§6 M8) — this image is what Fly.io/Railway runs.
+# (Architecture §4.7/§6 M8) — this is the image docker-compose.yml runs on the GCP VM.
 FROM python:3.12-slim AS builder
 
 WORKDIR /app
@@ -15,9 +15,9 @@ COPY src/ src/
 COPY config/ config/
 COPY scripts/ scripts/
 
-# The volume mount point (fly.toml) — same relative "data/" layout the code already
-# assumes (DEFAULT_DB_PATH, config/default.yaml's relative paths, etc.), so nothing in
-# storage/db.py or strategy/risk.py needs a deploy-specific path override.
+# The volume mount point (docker-compose.yml's ./data bind mount) — same relative "data/"
+# layout the code already assumes (DEFAULT_DB_PATH, config/default.yaml's relative paths,
+# etc.), so nothing in storage/db.py or strategy/risk.py needs a deploy-specific path override.
 RUN mkdir -p data/db data/raw data/artifacts data/logs
 
 EXPOSE 8080

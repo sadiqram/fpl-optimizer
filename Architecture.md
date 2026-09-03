@@ -337,12 +337,21 @@ cookie (`frontend/src/lib/session.ts`); every subsequent page/action is a Next.j
 Component or Server Function that reads that cookie and forwards the token to the backend.
 The browser only ever talks to the Next.js server, never directly to FastAPI.
 
-**Deployment topology:** Next.js on Vercel, FastAPI on Fly.io with SQLite unchanged on a
-persistent volume (no Postgres migration — Architecture §4.2's "SQLite is enough at this
-scale" reasoning still applies; the constraint was never SQLite itself, only that most PaaS
-filesystems don't survive a redeploy). The backend runs one always-on machine rather than the
-usual scale-to-zero default, since scaling to zero would reintroduce exactly the "nothing
-wakes it up for the daily job" failure this was built to fix.
+**Deployment topology:** Next.js on Vercel, FastAPI on a GCP `e2-micro` VM (Always Free
+tier — chosen over Fly.io/Render specifically to avoid ongoing hosting cost, since neither
+offers a free tier that's both always-on and disk-persistent) with SQLite unchanged on the
+VM's boot disk (no Postgres migration — Architecture §4.2's "SQLite is enough at this scale"
+reasoning still applies; the constraint was never SQLite itself, only that most PaaS
+filesystems don't survive a redeploy, which a plain VM's own disk doesn't have to worry
+about). The backend runs as a long-lived Docker container (`restart: always` in
+`docker-compose.yml`) rather than anything that scales to zero, for the same "nothing wakes
+it up for the daily job" reason as before — the always-on requirement didn't change, only
+which platform provides it. Caddy runs alongside it in the same compose stack purely for
+automatic TLS (Let's Encrypt); it isn't part of the app's request path in any logical sense.
+`git pull` + `docker compose up -d --build` over SSH (triggered by
+`.github/workflows/gcp-deploy.yml` on push to `main`) replaces `flyctl deploy` — functionally
+the same "push to main redeploys" behavior, at the cost of the VM being something this
+project now has to patch/maintain itself rather than a managed platform doing it.
 
 **A known rough edge:** FastAPI dispatches each sync dependency and route body via anyio's
 threadpool independently, so a `sqlite3.Connection` opened for one request can be used by a

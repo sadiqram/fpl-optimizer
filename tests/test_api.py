@@ -154,6 +154,22 @@ def test_squad_sync_requires_connected_team(client: TestClient):
     assert "No FPL team connected" in r.json()["detail"]
 
 
+def test_get_squad_returns_player_names_clubs_and_values(client: TestClient, db_path: Path):
+    """Regression guard: the squad page renders this endpoint's response as the actual
+    15-player squad (name/club/value), not just the sync summary counts."""
+    headers = _auth_headers(client)
+    user_id = client.get("/auth/me", headers=headers).json()["id"]
+    _seed_owned_squad(db_path, user_id)
+
+    r = client.get("/squad/2025-26/2", headers=headers)
+    assert r.status_code == 200, r.text
+    owned = r.json()["owned_squad"]
+    assert len(owned) == 15
+    assert {"web_name", "position", "team_short_name", "team_name", "current_price"} <= owned[0].keys()
+    assert all(row["web_name"] == f"P{row['player_id']}" for row in owned)
+    assert all(row["current_price"] == 45 + (row["player_id"] % 10) * 5 for row in owned)
+
+
 # --- recommend --------------------------------------------------------------------------
 
 def test_recommend_roundtrip_and_tenant_isolation(client: TestClient):

@@ -2,7 +2,8 @@
 
 DB_PATH defaults to the same relative path the CLI uses (`cli.DEFAULT_DB_PATH`) so local dev
 against the same SQLite file just works; the deployed environment overrides it via `DB_PATH`
-to point at the Fly.io volume mount (Architecture §4.2/§4.7 — same file, no format change).
+to point at the GCP VM's bind-mounted data dir (Architecture §4.2/§4.7 — same file, no format
+change).
 """
 
 from __future__ import annotations

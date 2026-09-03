@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState } from "react";
+import { useActionState, useEffect, useRef, useState } from "react";
 import { PlayerList } from "@/components/PlayerList";
 import { createRecommendationAction, type RecommendState } from "./actions";
 
@@ -9,6 +9,22 @@ const MODELS = ["poisson", "naive", "gbm"];
 
 export default function RecommendPage() {
   const [state, formAction, pending] = useActionState(createRecommendationAction, initialState);
+  const [season, setSeason] = useState("2026-27");
+  const [gameweek, setGameweek] = useState("1");
+  const [model, setModel] = useState("poisson");
+
+  // React 19's form-action reset restores controlled <input>s but not <select>s (the browser's
+  // native post-submit form.reset() clobbers the <select> DOM node and React never re-syncs it).
+  // Force a remount with the current value once the action settles.
+  const [selectKey, setSelectKey] = useState(0);
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    setSelectKey((k) => k + 1);
+  }, [state]);
 
   return (
     <div className="max-w-2xl">
@@ -21,15 +37,21 @@ export default function RecommendPage() {
       <form action={formAction} className="card p-6 flex flex-wrap items-end gap-3 mb-6">
         <div>
           <label className="label" htmlFor="season">Season</label>
-          <input className="input" id="season" name="season" placeholder="2026-27" required defaultValue="2026-27" />
+          <input
+            className="input" id="season" name="season" placeholder="2026-27" required
+            value={season} onChange={(e) => setSeason(e.target.value)}
+          />
         </div>
         <div>
           <label className="label" htmlFor="gameweek">Gameweek</label>
-          <input className="input w-24" id="gameweek" name="gameweek" type="number" min={1} required defaultValue={1} />
+          <input
+            className="input w-24" id="gameweek" name="gameweek" type="number" min={1} required
+            value={gameweek} onChange={(e) => setGameweek(e.target.value)}
+          />
         </div>
         <div>
           <label className="label" htmlFor="model">Model</label>
-          <select className="input" id="model" name="model" defaultValue="poisson">
+          <select key={selectKey} className="input" id="model" name="model" value={model} onChange={(e) => setModel(e.target.value)}>
             {MODELS.map((m) => <option key={m} value={m}>{m}</option>)}
           </select>
         </div>
